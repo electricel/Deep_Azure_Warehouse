@@ -106,7 +106,17 @@ DEFAULT_PASSWORD = os.environ.get("WAREHOUSE_ADMIN_PASSWORD", "admin123")
 ADMIN_PASSWORD_FROM_ENV = bool(os.environ.get("WAREHOUSE_ADMIN_PASSWORD"))
 APP_ENV = os.environ.get("WAREHOUSE_ENV", os.environ.get("APP_ENV", "development")).strip().lower()
 DEFAULT_PASSWORD_IN_USE = DEFAULT_ADMIN == "admin" and DEFAULT_PASSWORD == "admin123"
-INSECURE_ADMIN_PASSWORDS = {"admin123", "change-this-strong-password", "password", "123456", "12345678"}
+INSECURE_ADMIN_PASSWORDS = {
+    "admin",
+    "admin123",
+    "change-this-strong-password",
+    "letmein",
+    "password",
+    "qwerty",
+    "root",
+    "123456",
+    "12345678",
+}
 DATA_KEY_PLACEHOLDERS = {"change-this-32-byte-data-encryption-key", "replace-with-generated-secret"}
 DATA_ENCRYPTION_ENABLED = os.environ.get("WAREHOUSE_DATA_ENCRYPTION", "1").strip().lower() not in {
     "0",
@@ -327,11 +337,18 @@ def ensure_crypto_ready():
         data_encryption_key(required=True)
 
 
+def admin_password_is_insecure(password):
+    return str(password or "").strip().lower() in INSECURE_ADMIN_PASSWORDS
+
+
 def enforce_production_secrets():
     if APP_ENV not in ("production", "prod"):
         return
-    if DEFAULT_PASSWORD in INSECURE_ADMIN_PASSWORDS:
-        raise RuntimeError("Set a strong WAREHOUSE_ADMIN_PASSWORD before production start.")
+    if admin_password_is_insecure(DEFAULT_PASSWORD):
+        raise RuntimeError(
+            "WAREHOUSE_ADMIN_PASSWORD is insecure or still uses a default value. "
+            "Set a private strong password before production start."
+        )
     if DATA_ENCRYPTION_ENABLED:
         data_encryption_key(required=True)
 

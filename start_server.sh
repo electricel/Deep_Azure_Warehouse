@@ -27,6 +27,14 @@ if [ -z "${WAREHOUSE_ADMIN_PASSWORD:-}" ]; then
   exit 1
 fi
 
+case "$(printf '%s' "$WAREHOUSE_ADMIN_PASSWORD" | tr '[:upper:]' '[:lower:]')" in
+  admin|admin123|change-this-strong-password|letmein|password|qwerty|root|123456|12345678)
+    echo "ERROR: WAREHOUSE_ADMIN_PASSWORD is too weak or still uses a default value." >&2
+    echo "Use a private strong password, for example 12+ characters with letters and numbers." >&2
+    exit 1
+    ;;
+esac
+
 if [ -z "${WAREHOUSE_DATA_KEY:-}" ]; then
   echo "ERROR: WAREHOUSE_DATA_KEY is not set." >&2
   echo "Run once: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"" >&2

@@ -32,6 +32,21 @@ if (-not $AdminPassword) {
   throw "WAREHOUSE_ADMIN_PASSWORD is not set. Pass -AdminPassword or set the environment variable before production start."
 }
 
+$insecureAdminPasswords = @(
+  "admin",
+  "admin123",
+  "change-this-strong-password",
+  "letmein",
+  "password",
+  "qwerty",
+  "root",
+  "123456",
+  "12345678"
+)
+if ($insecureAdminPasswords -contains $AdminPassword.Trim().ToLowerInvariant()) {
+  throw "WAREHOUSE_ADMIN_PASSWORD is too weak or still uses a default value. Use a private strong password, for example 12+ characters with letters and numbers."
+}
+
 if (-not $DataKey) {
   $DataKey = $env:WAREHOUSE_DATA_KEY
 }

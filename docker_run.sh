@@ -13,6 +13,14 @@ if grep -Eq '^WAREHOUSE_ADMIN_PASSWORD=change-this-strong-password\s*$' .env; th
   exit 1
 fi
 
+admin_password=$(awk -F= '/^WAREHOUSE_ADMIN_PASSWORD=/{print substr($0, index($0,$2))}' .env | tail -n 1 | sed "s/^['\"]//; s/['\"]$//" | tr '[:upper:]' '[:lower:]')
+case "$admin_password" in
+  admin|admin123|change-this-strong-password|letmein|password|qwerty|root|123456|12345678)
+    echo "ERROR: edit .env and replace WAREHOUSE_ADMIN_PASSWORD with a private strong password."
+    exit 1
+    ;;
+esac
+
 if grep -Eq '^WAREHOUSE_DATA_KEY=change-this-32-byte-data-encryption-key\s*$' .env; then
   echo "ERROR: edit .env and replace WAREHOUSE_DATA_KEY with a generated data encryption key."
   exit 1

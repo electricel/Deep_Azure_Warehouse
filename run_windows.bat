@@ -52,6 +52,15 @@ if "%WAREHOUSE_ADMIN_PASSWORD%"=="" (
   exit /b 1
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$p=($env:WAREHOUSE_ADMIN_PASSWORD + '').Trim().ToLowerInvariant(); " ^
+  "$bad=@('admin','admin123','change-this-strong-password','letmein','password','qwerty','root','123456','12345678'); " ^
+  "if ($bad -contains $p) { Write-Host 'ERROR: WAREHOUSE_ADMIN_PASSWORD is too weak or still uses a default value.'; Write-Host 'Use a private strong password, for example 12+ characters with letters and numbers.'; exit 1 }"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 if "%WAREHOUSE_DATA_KEY%"=="" (
   echo.
   echo Set data encryption key. Keep this key backed up outside the data folder.
