@@ -20,6 +20,16 @@ if errorlevel 1 (
   )
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0configure_env.ps1" -EnvPath "%~dp0.env" -DataDir "%~dp0data"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~dp0.env") do (
+  if not "%%A"=="" set "%%A=%%B"
+)
+
 if "%WAREHOUSE_ENV%"=="" set WAREHOUSE_ENV=production
 if "%WAREHOUSE_HOST%"=="" set WAREHOUSE_HOST=127.0.0.1
 if "%WAREHOUSE_PORT%"=="" set WAREHOUSE_PORT=8088

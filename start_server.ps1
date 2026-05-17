@@ -24,6 +24,45 @@ if (-not $DataDir) {
   $DataDir = Join-Path $Root "data"
 }
 
+$EnvPath = Join-Path $Root ".env"
+if (Test-Path (Join-Path $Root "configure_env.ps1")) {
+  powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "configure_env.ps1") -EnvPath $EnvPath -DataDir $DataDir
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+}
+
+if (Test-Path $EnvPath) {
+  foreach ($raw in Get-Content $EnvPath) {
+    $line = $raw.Trim()
+    if (-not $line -or $line.StartsWith("#")) {
+      continue
+    }
+    if ($line.StartsWith("export ")) {
+      $line = $line.Substring(7).Trim()
+    }
+    $index = $line.IndexOf("=")
+    if ($index -lt 1) {
+      continue
+    }
+    $key = $line.Substring(0, $index).Trim()
+    if ($key -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+      continue
+    }
+    $value = $line.Substring($index + 1).Trim()
+    if ($value.Length -ge 2) {
+      $first = $value.Substring(0, 1)
+      $last = $value.Substring($value.Length - 1, 1)
+      if (($first -eq "'" -and $last -eq "'") -or ($first -eq '"' -and $last -eq '"')) {
+        $value = $value.Substring(1, $value.Length - 2)
+      }
+    }
+    if (-not [Environment]::GetEnvironmentVariable($key, "Process")) {
+      [Environment]::SetEnvironmentVariable($key, $value, "Process")
+    }
+  }
+}
+
 if (-not $AdminPassword) {
   $AdminPassword = $env:WAREHOUSE_ADMIN_PASSWORD
 }

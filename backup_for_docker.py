@@ -30,6 +30,7 @@ APP_INCLUDE_FILES = {
     "apply_patch.ps1",
     "backup_for_docker.bat",
     "backup_for_docker.py",
+    "configure_env.ps1",
     "docker-compose.yml",
     "docker_run.ps1",
     "docker_run.sh",

@@ -19,6 +19,16 @@ if errorlevel 1 (
   )
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0configure_env.ps1" -EnvPath "%~dp0.env" -DataDir "%~dp0data"
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~dp0.env") do (
+  if not "%%A"=="" set "%%A=%%B"
+)
+
 echo Checking for an old Warehouse server on the configured port...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$cfg='server_config.json'; $port=8088; if (Test-Path $cfg) { try { $json=Get-Content $cfg -Raw | ConvertFrom-Json; if ($json.port) { $port=[int]$json.port } } catch {} }; " ^

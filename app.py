@@ -39,6 +39,37 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = BASE_DIR / "server_config.json"
 CHANGELOG_PATH = BASE_DIR / "CHANGELOG.md"
+ENV_PATH = BASE_DIR / ".env"
+
+
+def load_env_file(path=ENV_PATH):
+    path = Path(path)
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except Exception:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if not os.environ.get(key):
+            os.environ[key] = value
+
+
+load_env_file()
 
 DEFAULT_CONFIG = {
     "site_name": "Warehouse Inventory Server",
