@@ -11,30 +11,49 @@
     return (Number(value) || 0).toLocaleString("zh-CN");
   }
 
+  function appendText(parent, tag, text, className) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    node.textContent = text || "";
+    parent.appendChild(node);
+    return node;
+  }
+
+  function createMetric(label, qty, entries, className) {
+    const section = document.createElement("section");
+    if (className) section.className = className;
+    appendText(section, "small", label);
+    appendText(section, "strong", numberText(qty));
+    appendText(section, "em", `${numberText(entries)} 条记录`);
+    return section;
+  }
+
   function renderBoard(items, data) {
     const totals = data.totals || {};
     const top = items.slice(0, 4);
     const totalQty = totals.qty || top.reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
     const entries = totals.entries || top.reduce((sum, item) => sum + (Number(item.entries) || 0), 0);
-    root.innerHTML = "";
+    root.textContent = "";
     root.classList.add("analytics-product-render");
 
     const shell = document.createElement("article");
     shell.className = "analytics-device product-device product-device-main";
-    shell.innerHTML = `
-      <div class="device-toolbar"><span></span><span></span><span></span></div>
-      <div class="analytics-live-grid">
-        <section class="analytics-live-main"><small>Inventory Core</small><strong>${numberText(totalQty)}</strong><em>${numberText(entries)} 条库存记录</em></section>
-        ${top.map((item) => `<section><small>${shortLabel(item.label)}</small><strong>${numberText(item.qty)}</strong><em>${numberText(item.entries || 1)} 条记录</em></section>`).join("")}
-      </div>
-    `;
+    const toolbar = document.createElement("div");
+    toolbar.className = "device-toolbar";
+    toolbar.append(document.createElement("span"), document.createElement("span"), document.createElement("span"));
+    const grid = document.createElement("div");
+    grid.className = "analytics-live-grid";
+    grid.appendChild(createMetric("Inventory Core", totalQty, entries, "analytics-live-main"));
+    top.forEach((item) => grid.appendChild(createMetric(shortLabel(item.label), item.qty, item.entries || 1)));
+    shell.append(toolbar, grid);
 
     const chips = document.createElement("div");
     chips.className = "analytics-live-chips";
     top.slice(0, 3).forEach((item, index) => {
       const chip = document.createElement("article");
       chip.className = `product-chip analytics-chip analytics-chip-${index + 1}`;
-      chip.innerHTML = `<span>${shortLabel(item.label)}</span><strong>${numberText(item.qty)}</strong>`;
+      appendText(chip, "span", shortLabel(item.label));
+      appendText(chip, "strong", numberText(item.qty));
       chips.appendChild(chip);
     });
 
@@ -48,7 +67,7 @@
       ...(data.low_stock || []).slice(0, 3).map((item) => `低库存：${item.name}，剩余 ${item.qty}`),
       ...(data.tips || []),
     ];
-    tipsRoot.innerHTML = "";
+    tipsRoot.textContent = "";
     warnings.slice(0, 6).forEach((text) => {
       const pill = document.createElement("div");
       pill.className = "insight-pill";
@@ -63,14 +82,16 @@
       const data = await res.json();
       const items = data.categories || [];
       if (!items.length) {
-        root.innerHTML = '<div class="empty">暂无库存数据</div>';
+        root.textContent = "";
+        appendText(root, "div", "暂无库存数据", "empty");
         renderTips(data);
         return;
       }
       renderBoard(items, data);
       renderTips(data);
     } catch (err) {
-      root.innerHTML = `<div class="empty">库存洞察读取失败：${err.message}</div>`;
+      root.textContent = "";
+      appendText(root, "div", `库存洞察读取失败：${err.message || "网络异常"}`, "empty");
     }
   }
 

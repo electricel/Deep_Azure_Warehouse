@@ -205,6 +205,22 @@
     imageStatus.dataset.mode = mode || "idle";
   }
 
+  function appendText(parent, tag, text) {
+    const node = document.createElement(tag);
+    node.textContent = text || "";
+    parent.appendChild(node);
+    return node;
+  }
+
+  function safeHttpUrl(value) {
+    try {
+      const url = new URL(String(value || ""), window.location.href);
+      return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
   function renderStepModel(model, product, specs) {
     if (!stepStage || !stepMeta) return;
     const payload = model || {};
@@ -302,7 +318,8 @@
       button.className = "image-recognition-result";
       const title = item.name || item.lcsc_code || `识别结果 ${index + 1}`;
       const meta = [item.lcsc_code, item.value_spec, item.package, item.brand, item.quantity ? `数量 ${item.quantity}` : ""].filter(Boolean).join(" / ");
-      button.innerHTML = `<strong>${title}</strong><span>${meta || "点击写入表单"}</span>`;
+      appendText(button, "strong", title);
+      appendText(button, "span", meta || "点击写入表单");
       button.addEventListener("click", () => applyRecognizedItem(item));
       imageResults.appendChild(button);
     });
@@ -377,15 +394,22 @@
       const specs = data.specs || {};
       rewritePrefill(code, product, specs, data.suggested_category);
       renderStepModel(data.model_3d || {}, product, specs);
-      preview.innerHTML = [
-        `<strong>${product.product_model || product.product_name || code}</strong>`,
-        product.product_name ? `<span>${product.product_name}</span>` : "",
-        specs.value_spec ? `<span>${specs.value_spec}</span>` : "",
-        specs.package ? `<span>封装 ${specs.package}</span>` : "",
-        (specs.voltage || specs.power) ? `<span>${specs.voltage || specs.power}</span>` : "",
-        product.stock ? `<span>立创库存 ${product.stock}</span>` : "",
-        (specs.url || product.product_url) ? `<a href="${specs.url || product.product_url}" target="_blank" rel="noopener">打开 LCSC 商品页</a>` : "",
-      ].filter(Boolean).join("");
+      preview.textContent = "";
+      appendText(preview, "strong", product.product_model || product.product_name || code);
+      if (product.product_name) appendText(preview, "span", product.product_name);
+      if (specs.value_spec) appendText(preview, "span", specs.value_spec);
+      if (specs.package) appendText(preview, "span", `封装 ${specs.package}`);
+      if (specs.voltage || specs.power) appendText(preview, "span", specs.voltage || specs.power);
+      if (product.stock) appendText(preview, "span", `立创库存 ${product.stock}`);
+      const productUrl = safeHttpUrl(specs.url || product.product_url);
+      if (productUrl) {
+        const link = document.createElement("a");
+        link.href = productUrl;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = "打开 LCSC 商品页";
+        preview.appendChild(link);
+      }
     } catch (err) {
       preview.textContent = `联网查询失败：${err.message}`;
       preview.classList.add("error");

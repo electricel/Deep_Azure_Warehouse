@@ -3,6 +3,7 @@ import csv
 import hashlib
 import hmac
 import html
+import ipaddress
 import io
 import json
 import mimetypes
@@ -92,6 +93,8 @@ DEFAULT_CONFIG = {
     "ui_product_depth": "220",
     "ui_product_tilt": "10",
     "ui_product_speed": "22",
+    "allowed_hosts": "",
+    "allowed_api_hosts": "",
 }
 
 
@@ -177,6 +180,12 @@ LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCKOUT_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 8
 PASSWORD_HASH_ITERATIONS = 600000
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_FIELD_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+CSRF_TOKEN_TTL_SECONDS = SESSION_TTL_SECONDS
+MIN_USER_PASSWORD_LENGTH = 10
+MIN_ADMIN_PASSWORD_LENGTH = 14
 MAX_FORM_BODY_BYTES = 1 * 1024 * 1024
 MAX_MULTIPART_BODY_BYTES = 100 * 1024 * 1024
 BOM_UPLOAD_MAX_BYTES = 12 * 1024 * 1024
@@ -311,6 +320,163 @@ def now_text():
 
 def short_date():
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def split_config_list(value):
+    parts = re.split(r"[\s,;]+", str(value or ""))
+    return [part.strip().lower() for part in parts if part.strip()]
+
+
+def normalize_host_value(value):
+    host = str(value or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+    elif host.count(":") > 1:
+        return host.rstrip(".")
+    else:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".")
+
+
+def configured_allowed_hosts():
+    values = split_config_list(os.environ.get("WAREHOUSE_ALLOWED_HOSTS", ""))
+    values.extend(split_config_list(BOOT_CONFIG.get("allowed_hosts", "")))
+    public_url = str(BOOT_CONFIG.get("public_url") or "").strip()
+    if public_url:
+        parsed = urllib.parse.urlparse(public_url)
+        if parsed.hostname:
+            values.append(parsed.hostname.lower())
+    if TUNNEL_URL:
+        parsed = urllib.parse.urlparse(TUNNEL_URL)
+        if parsed.hostname:
+            values.append(parsed.hostname.lower())
+    local_hosts = ["localhost", "127.0.0.1", "::1"]
+    bind_host = normalize_host_value(HOST)
+    if bind_host and bind_host not in ("0.0.0.0", "::"):
+        local_hosts.append(bind_host)
+    elif HOST in ("0.0.0.0", "::"):
+        local_hosts.append("__private_network__")
+        try:
+            local_hosts.append(local_ip())
+        except Exception:
+            pass
+    try:
+        local_hosts.extend([socket.gethostname(), socket.getfqdn()])
+    except Exception:
+        pass
+    return {normalize_host_value(item) for item in [*values, *local_hosts] if normalize_host_value(item)}
+
+
+def host_matches_allowed(host, allowed_hosts):
+    normalized = normalize_host_value(host)
+    if not normalized:
+        return False
+    for allowed in allowed_hosts:
+        allowed = normalize_host_value(allowed)
+        if not allowed:
+            continue
+        if allowed == "*":
+            return True
+        if allowed == "__private_network__":
+            try:
+                ip = ipaddress.ip_address(normalized)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return True
+            except ValueError:
+                pass
+        if allowed.startswith("*.") and normalized.endswith(allowed[1:]):
+            return True
+        if normalized == allowed:
+            return True
+    return False
+
+
+def allowed_external_api_hosts():
+    raw = os.environ.get("WAREHOUSE_ALLOWED_API_HOSTS") or BOOT_CONFIG.get("allowed_api_hosts", "")
+    return {normalize_host_value(item) for item in split_config_list(raw)}
+
+
+def endpoint_host_is_allowed(host):
+    allowed = allowed_external_api_hosts()
+    if not allowed:
+        return True
+    return host_matches_allowed(host, allowed)
+
+
+def ip_is_forbidden_outbound(ip_text):
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def validate_external_api_url(url):
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("API 地址无效，只允许 http 或 https。")
+    if parsed.username or parsed.password:
+        raise ValueError("API 地址不能包含用户名或密码。")
+    if not endpoint_host_is_allowed(parsed.hostname):
+        raise ValueError("API 地址不在服务器允许的外部域名白名单内。")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError("API 地址域名无法解析。") from exc
+    addresses = {info[4][0] for info in infos if info and info[4]}
+    if not addresses:
+        raise ValueError("API 地址域名无法解析。")
+    if any(ip_is_forbidden_outbound(address) for address in addresses):
+        raise ValueError("API 地址解析到内网、回环或保留地址，已阻止。")
+    return url
+
+
+class SafeExternalRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_external_api_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def safe_external_urlopen(request, timeout=30):
+    url = request.full_url if isinstance(request, urllib.request.Request) else str(request or "")
+    validate_external_api_url(url)
+    opener = urllib.request.build_opener(SafeExternalRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
+def security_error_message(exc=None):
+    return "请求未通过安全校验，请检查来源、权限或后台配置。"
+
+
+def public_error_message(exc=None, fallback="操作失败，请检查输入后重试。"):
+    if isinstance(exc, (ValueError, LookupError, OverflowError, PermissionError)):
+        return str(exc)
+    return fallback
+
+
+def password_policy_error(password, role="user", username=""):
+    password = str(password or "")
+    role = str(role or "user").lower()
+    min_len = MIN_ADMIN_PASSWORD_LENGTH if role in ("admin", "superadmin") else MIN_USER_PASSWORD_LENGTH
+    if len(password) < min_len:
+        return f"密码至少需要 {min_len} 位。"
+    lowered = password.lower()
+    if lowered in INSECURE_ADMIN_PASSWORDS or lowered == str(username or "").strip().lower():
+        return "密码过于常见或与账号相同。"
+    if re.fullmatch(r"\d+", password) or re.fullmatch(r"[A-Za-z]+", password):
+        return "密码不能只包含数字或只包含字母。"
+    if "123456" in lowered or "password" in lowered or "qwerty" in lowered:
+        return "密码包含常见弱口令片段。"
+    return ""
 
 
 def ensure_dirs():
@@ -1212,6 +1378,8 @@ def save_config(config):
     clean["ui_product_depth"] = str(clamp_int(clean.get("ui_product_depth"), 220, 120, 360))
     clean["ui_product_tilt"] = str(clamp_int(clean.get("ui_product_tilt"), 10, 0, 18))
     clean["ui_product_speed"] = str(clamp_int(clean.get("ui_product_speed"), 22, 8, 40))
+    clean["allowed_hosts"] = ",".join(split_config_list(clean.get("allowed_hosts", "")))
+    clean["allowed_api_hosts"] = ",".join(split_config_list(clean.get("allowed_api_hosts", "")))
     with db() as conn:
         for key, value in clean.items():
             conn.execute(
@@ -7349,7 +7517,7 @@ def fetch_lcsc_product(code):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with safe_external_urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         return parse_lcsc_search_html(code, body)
     except Exception as exc:
@@ -7444,7 +7612,7 @@ def fetch_lcsc_categories(force=False):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with safe_external_urlopen(req, timeout=20) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         match = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', text, re.S)
         if not match:
@@ -7598,7 +7766,7 @@ def probe_model_url(url, timeout=8):
     }
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with safe_external_urlopen(request, timeout=timeout) as resp:
             return {
                 "url": url,
                 "ok": 200 <= int(resp.status) < 400,
@@ -7640,7 +7808,7 @@ def fetch_lcsc_model_links(product):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with safe_external_urlopen(req, timeout=12) as resp:
             text = resp.read().decode("utf-8", errors="replace")
     except Exception:
         return []
@@ -7705,7 +7873,7 @@ def fetch_easyeda_model_info(lcsc_code):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=18) as resp:
+        with safe_external_urlopen(req, timeout=18) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         return {
@@ -9580,6 +9748,7 @@ def render_layout(title, body, user=None, active="", scripts=None):
         """
     page_class = "app-shell top-shell" if user else "login-shell"
     page_scripts = render_script_tags([
+        "/static/security.js",
         "/static/nav_slime.js",
         "/static/pcb_attach.js",
         *(scripts or []),
@@ -9589,6 +9758,7 @@ def render_layout(title, body, user=None, active="", scripts=None):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{csrf_token}}">
   <title>{html.escape(title)} - Warehouse</title>
   <link rel="stylesheet" href="/static/app.css">
   {ui_theme_style(config)}
@@ -9605,12 +9775,13 @@ def render_layout(title, body, user=None, active="", scripts=None):
 
 def render_public_layout(title, body, scripts=None):
     config = get_config()
-    page_scripts = render_script_tags(scripts or [])
+    page_scripts = render_script_tags(["/static/security.js", *(scripts or [])])
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{csrf_token}}">
   <title>{html.escape(title)} - 沧溟战队仓管系统</title>
   <link rel="stylesheet" href="/static/app.css">
   {ui_theme_style(config)}
@@ -9636,6 +9807,7 @@ def render_pcb_keyframe_page():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{csrf_token}}">
   <title>PCB 3D Keyframe Lab - {html.escape(config.get("site_name", "Warehouse Inventory Server"))}</title>
   <link rel="stylesheet" href="/static/app.css">
   {ui_theme_style(config)}
@@ -9715,6 +9887,7 @@ def render_pcb_keyframe_page():
       <p class="pcb-lab-status" id="pcb-lab-status">Ready.</p>
     </aside>
   </main>
+  <script src="/static/security.js"></script>
   <script type="module" src="/static/pcb_keyframe_lab.js"></script>
 </body>
 </html>"""
@@ -13050,7 +13223,7 @@ def assistant_http_json(url, api_key="", body=None, timeout=30):
         method="GET" if body is None else "POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with safe_external_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -13627,6 +13800,8 @@ def admin_page(user, message="", error=""):
     <section class="form-panel">
       {flash_box(message, "ok")}{flash_box(error, "error")}
       <form class="entry-form" method="post" action="/admin">
+        <label class="wide">允许访问 Host 白名单<input name="allowed_hosts" value="{html.escape(config.get('allowed_hosts', ''))}" placeholder="warehouse.example.com,192.168.1.20"></label>
+        <label class="wide">外部 API 域名白名单<input name="allowed_api_hosts" value="{html.escape(config.get('allowed_api_hosts', ''))}" placeholder="api.openai.com,api.deepseek.com,openrouter.ai,www.szlcsc.com,easyeda.com,modules.easyeda.com"></label>
         <label>站点名称<input name="site_name" value="{html.escape(config['site_name'])}"></label>
         <label>监听主机<input name="host" value="{html.escape(config['host'])}"></label>
         <label>网站端口<input name="port" type="number" min="1" max="65535" value="{html.escape(config['port'])}"></label>
@@ -13713,6 +13888,10 @@ def admin_page(user, message="", error=""):
 class WarehouseHandler(BaseHTTPRequestHandler):
     server_version = "WarehouseInventory/2.0"
 
+    def setup(self):
+        super().setup()
+        self._cached_body = None
+
     def version_string(self):
         return self.server_version
 
@@ -13722,6 +13901,20 @@ class WarehouseHandler(BaseHTTPRequestHandler):
     def send_response(self, code, message=None):
         self._security_headers_sent = False
         super().send_response(code, message)
+
+    def reject_untrusted_host(self):
+        host = self.headers.get("Host", "")
+        if host_matches_allowed(host, configured_allowed_hosts()):
+            return False
+        payload = b"Bad Host Header"
+        self.send_response(HTTPStatus.BAD_REQUEST)
+        self.send_security_headers()
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.log_access_db(HTTPStatus.BAD_REQUEST)
+        return True
 
     def end_headers(self):
         self.send_security_headers()
@@ -13738,6 +13931,28 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if self.is_https_request():
             parts.append("Secure")
         return "; ".join(parts)
+
+    def csrf_cookie_value(self, token, max_age=None):
+        parts = [f"{CSRF_COOKIE_NAME}={token}", "Path=/", "SameSite=Lax"]
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        if self.is_https_request():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def csrf_token(self):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        token = cookie.get(CSRF_COOKIE_NAME)
+        value = token.value if token else ""
+        if re.fullmatch(r"[A-Za-z0-9_\-]{32,128}", value or ""):
+            return value
+        return secrets.token_urlsafe(32)
+
+    def inject_csrf_html(self, content, token):
+        token_html = html.escape(token, quote=True)
+        page = str(content or "").replace("{csrf_token}", token_html)
+        hidden = f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{token_html}">'
+        return re.sub(r"(<form\b(?=[^>]*\bmethod=[\"']?post\b)[^>]*>)", r"\1" + hidden, page, flags=re.I)
 
     def send_security_headers(self):
         if getattr(self, "_security_headers_sent", False):
@@ -13778,9 +13993,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
     def allowed_request_origins(self):
-        host = (self.headers.get("Host") or "").strip().lower()
         origins = set()
-        if host:
+        allowed_hosts = configured_allowed_hosts()
+        for host in allowed_hosts:
+            if host.startswith("*.") or host == "*":
+                continue
             origins.add(f"http://{host}")
             origins.add(f"https://{host}")
         public_url = str(BOOT_CONFIG.get("public_url") or "").strip()
@@ -13797,6 +14014,36 @@ class WarehouseHandler(BaseHTTPRequestHandler):
     def verify_same_origin_post(self):
         origin = self.request_origin()
         return not origin or origin in self.allowed_request_origins()
+
+    def read_cached_body(self):
+        if self._cached_body is None:
+            self._cached_body = self.rfile.read(self.request_body_size())
+        return self._cached_body
+
+    def csrf_token_from_request(self):
+        token = str(self.headers.get(CSRF_HEADER_NAME, "")).strip()
+        if token:
+            return token
+        ctype = self.headers.get("Content-Type", "").lower()
+        if "application/x-www-form-urlencoded" in ctype or not ctype:
+            try:
+                form = urllib.parse.parse_qs(self.read_cached_body().decode("utf-8", errors="replace"))
+            except Exception:
+                form = {}
+            return str(form.get(CSRF_FIELD_NAME, [""])[0]).strip()
+        if "multipart/form-data" in ctype:
+            try:
+                fields, _ = self.parse_multipart_body(self.read_cached_body())
+            except Exception:
+                fields = {}
+            return str(fields.get(CSRF_FIELD_NAME, "")).strip()
+        return ""
+
+    def verify_csrf_post(self):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie_token = cookie.get(CSRF_COOKIE_NAME)
+        request_token = self.csrf_token_from_request()
+        return bool(cookie_token and request_token and hmac.compare_digest(cookie_token.value, request_token))
 
     def request_body_size(self):
         return parse_int(self.headers.get("Content-Length"), 0)
@@ -13880,10 +14127,13 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             pass
 
     def send_html(self, content, status=HTTPStatus.OK, headers=None):
+        csrf_token = self.csrf_token()
+        content = self.inject_csrf_html(content, csrf_token)
         payload = content.encode("utf-8")
         self.send_response(status)
         self.send_security_headers()
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Set-Cookie", self.csrf_cookie_value(csrf_token, max_age=CSRF_TOKEN_TTL_SECONDS))
         self.send_header("Content-Length", str(len(payload)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -13924,14 +14174,14 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         size = self.request_body_size()
         if size > MAX_FORM_BODY_BYTES:
             raise ValueError("Request body is too large.")
-        raw = self.rfile.read(size).decode("utf-8", errors="replace")
+        raw = self.read_cached_body().decode("utf-8", errors="replace")
         return urllib.parse.parse_qs(raw)
 
     def read_json(self):
         size = self.request_body_size()
         if size > MAX_FORM_BODY_BYTES:
             raise ValueError("Request body is too large.")
-        raw = self.rfile.read(size).decode("utf-8", errors="replace")
+        raw = self.read_cached_body().decode("utf-8", errors="replace")
         if not raw.strip():
             return {}
         return json.loads(raw)
@@ -13955,16 +14205,12 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         form = self.read_form()
         return {key: values[-1] if isinstance(values, list) and values else "" for key, values in form.items()}
 
-    def read_multipart(self):
+    def parse_multipart_body(self, body):
         ctype = self.headers.get("Content-Type", "")
         match = re.search(r"boundary=(?P<boundary>[^;]+)", ctype)
         if not match:
             raise ValueError("上传格式不正确。")
         boundary = ("--" + match.group("boundary").strip('"')).encode()
-        size = self.request_body_size()
-        if size > MAX_MULTIPART_BODY_BYTES:
-            raise ValueError("Request body is too large.")
-        body = self.rfile.read(size)
         fields = {}
         files = {}
         for part in body.split(boundary):
@@ -14001,7 +14247,15 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                 fields[field_name] = content.decode("utf-8", errors="replace")
         return fields, files
 
+    def read_multipart(self):
+        size = self.request_body_size()
+        if size > MAX_MULTIPART_BODY_BYTES:
+            raise ValueError("Request body is too large.")
+        return self.parse_multipart_body(self.read_cached_body())
+
     def do_GET(self):
+        if self.reject_untrusted_host():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -14155,7 +14409,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return self.send_html(render_layout("未找到", '<section class="panel">页面不存在。</section>', user), HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if self.reject_untrusted_host():
+            return
         parsed = urllib.parse.urlparse(self.path)
+        if self.reject_oversized_request():
+            return
         if not self.verify_same_origin_post():
             if parsed.path.startswith("/api/"):
                 return self.send_json({"error": "Cross-site request blocked."}, HTTPStatus.FORBIDDEN)
@@ -14164,8 +14422,14 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                 HTTPStatus.FORBIDDEN,
                 headers=self.auth_cache_headers(),
             )
-        if self.reject_oversized_request():
-            return
+        if not self.verify_csrf_post():
+            if parsed.path.startswith("/api/"):
+                return self.send_json({"error": "CSRF token missing or invalid."}, HTTPStatus.FORBIDDEN)
+            return self.send_html(
+                render_auth("login", "请求安全令牌无效，请刷新页面后重新提交。"),
+                HTTPStatus.FORBIDDEN,
+                headers=self.auth_cache_headers(),
+            )
         if parsed.path == "/api/pcb-keyframes":
             user = current_user(self)
             if not is_admin_role(user):
@@ -15081,7 +15345,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                 }
             )
         except Exception as exc:
-            return self.send_json({"error": str(exc), "models_url": assistant_models_url(endpoint)}, HTTPStatus.BAD_GATEWAY)
+            return self.send_json({"error": public_error_message(exc, "模型列表读取失败，请检查 API 地址、白名单和网络。"), "models_url": assistant_models_url(endpoint)}, HTTPStatus.BAD_GATEWAY)
 
     def login(self):
         form = self.read_form()
@@ -15138,6 +15402,13 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         password = form.get("password", [""])[0]
         confirm = form.get("confirm", [""])[0]
         team_group = normalize_team_group(form.get("team_group", [""])[0])
+        policy_error = password_policy_error(password, "user", username)
+        if policy_error:
+            return self.send_html(
+                render_auth("register", policy_error),
+                HTTPStatus.BAD_REQUEST,
+                headers=self.auth_cache_headers(),
+            )
         if not username or len(password) < 6:
             return self.send_html(
                 render_auth("register", "账号不能为空，密码至少 6 位。"),
@@ -15518,6 +15789,9 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         password = form.get("password", [""])[0]
         role = form.get("role", ["user"])[0]
         team_group = normalize_team_group(form.get("team_group", [""])[0])
+        policy_error = password_policy_error(password, role, username)
+        if policy_error:
+            return self.send_html(users_page(user, error=policy_error), HTTPStatus.BAD_REQUEST)
         if not username or len(password) < 6 or role not in ("user", "admin"):
             return self.send_html(users_page(user, error="账号不能为空，密码至少 6 位。"), HTTPStatus.BAD_REQUEST)
         try:
@@ -15544,6 +15818,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             return self.send_html(admin_page(user, error="无权限。"), HTTPStatus.FORBIDDEN)
         form = self.read_form()
         values = {key: form.get(key, [DEFAULT_ASSISTANT_CONFIG.get(key, "")])[0] for key in DEFAULT_ASSISTANT_CONFIG}
+        try:
+            if str(values.get("enabled", "")).strip() == "1" or str(values.get("endpoint", "")).strip():
+                validate_external_api_url(assistant_chat_url(values.get("endpoint", "")))
+        except Exception as exc:
+            return self.send_html(admin_page(user, error=public_error_message(exc, "API 配置未通过安全校验。")), HTTPStatus.BAD_REQUEST)
         save_assistant_config(values)
         return self.send_html(admin_page(user, message="库存智能助手 API 配置已保存。"))
 
@@ -15555,6 +15834,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             key: form.get(key, [DEFAULT_IMAGE_RECOGNITION_CONFIG.get(key, "")])[0]
             for key in DEFAULT_IMAGE_RECOGNITION_CONFIG
         }
+        try:
+            if str(values.get("enabled", "")).strip() == "1" or str(values.get("endpoint", "")).strip():
+                validate_external_api_url(assistant_chat_url(values.get("endpoint", "")))
+        except Exception as exc:
+            return self.send_html(image_recognition_config_page(user, error=public_error_message(exc, "图片识别 API 配置未通过安全校验。")), HTTPStatus.BAD_REQUEST)
         save_image_recognition_config(values)
         return self.send_html(image_recognition_config_page(user, message="入库图片识别 API 配置已保存。"))
 
