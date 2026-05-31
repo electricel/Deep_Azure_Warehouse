@@ -340,6 +340,22 @@ def normalize_host_value(value):
     return host.rstrip(".")
 
 
+def allowed_origin_for_host(host, scheme):
+    raw = str(host or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    parsed = urllib.parse.urlparse(f"//{raw}")
+    netloc = parsed.netloc.lower()
+    if not netloc:
+        normalized = normalize_host_value(raw)
+        return f"{scheme}://{normalized}" if normalized else ""
+    return f"{scheme}://{netloc}"
+
+
 def configured_allowed_hosts():
     values = split_config_list(os.environ.get("WAREHOUSE_ALLOWED_HOSTS", ""))
     values.extend(split_config_list(BOOT_CONFIG.get("allowed_hosts", "")))
@@ -367,6 +383,37 @@ def configured_allowed_hosts():
     except Exception:
         pass
     return {normalize_host_value(item) for item in [*values, *local_hosts] if normalize_host_value(item)}
+
+
+def configured_allowed_origins():
+    origins = set()
+    values = split_config_list(os.environ.get("WAREHOUSE_ALLOWED_HOSTS", ""))
+    values.extend(split_config_list(BOOT_CONFIG.get("allowed_hosts", "")))
+    host_values = [*values, "localhost", "127.0.0.1", "[::1]"]
+    bind_host = normalize_host_value(HOST)
+    if bind_host and bind_host not in ("0.0.0.0", "::"):
+        host_values.append(HOST)
+    elif HOST in ("0.0.0.0", "::"):
+        try:
+            host_values.append(local_ip())
+        except Exception:
+            pass
+    try:
+        host_values.extend([socket.gethostname(), socket.getfqdn()])
+    except Exception:
+        pass
+    for host in host_values:
+        if not host or str(host).startswith("*.") or str(host) == "*":
+            continue
+        raw = str(host).strip()
+        has_port = bool(urllib.parse.urlparse(f"//{raw}").port)
+        for scheme in ("http", "https"):
+            origin = allowed_origin_for_host(raw, scheme)
+            if origin:
+                origins.add(origin)
+            if not has_port and str(raw).strip("[]") in {"localhost", "127.0.0.1", "::1", HOST, bind_host}:
+                origins.add(f"{scheme}://{normalize_host_value(raw)}:{PORT}")
+    return origins
 
 
 def host_matches_allowed(host, allowed_hosts):
@@ -7062,8 +7109,8 @@ def soldering_consumption_summary_html(consumption, compact=False):
     """
 
 
-def inventory_stock_snapshot(conn, category, name, aliases=None):
-    return stock_for_item(conn, category, name, aliases or [])
+def inventory_stock_snapshot(conn, category, name, aliases=None, package=None):
+    return stock_for_item(conn, category, name, aliases or [], package=package)
 
 
 def related_purchase_status(conn, record, consumption_rows):
@@ -7392,6 +7439,19 @@ COMMON_PACKAGE_CODES = {
     "C1210",
     "C1812",
     "C2220",
+}
+
+PACKAGE_SIZE_CODES = {
+    "0201",
+    "0402",
+    "0603",
+    "0805",
+    "1206",
+    "1210",
+    "1812",
+    "2010",
+    "2512",
+    "2220",
 }
 
 
@@ -8459,57 +8519,38 @@ def bom_group_key(row, mapping):
     return ("generic", normalize_key(comment), normalize_key(footprint))
 
 
+def bom_match_identity(row, mapping, category):
+    value = first_value(row, mapping, ["value", "comment", "name"])
+    part_name = first_value(row, mapping, ["name", "comment", "manufacturer_part", "supplier_part"])
+    package = first_value(row, mapping, ["footprint", "package"])
+    manufacturer_part = first_value(row, mapping, ["manufacturer_part", "part_number"])
+    supplier_part = first_value(row, mapping, ["supplier_part", "lcsc_part"])
+    aliases = [
+        value,
+        part_name,
+        manufacturer_part,
+        supplier_part,
+    ] + component_value_aliases(
+        " ".join([value, manufacturer_part, package]),
+        category,
+    )
+    return {
+        "part_name": part_name,
+        "value": value,
+        "package": package,
+        "manufacturer_part_number": manufacturer_part,
+        "supplier_code": supplier_part,
+        "lcsc_code": (extract_lcsc_codes([supplier_part]) or [""])[0],
+        "aliases": list(dict.fromkeys(alias for alias in aliases if alias)),
+    }
+
+
 def parse_bom_rows(rows):
     if not rows:
         return []
-    header_aliases = {
-        "category": {"类别", "商品类别", "类型", "category", "class", "type"},
-        "name": {"名称", "商品名称", "器件", "器件名称", "物料", "物料名称", "型号", "name", "item", "part"},
-        "quantity": {"数量", "需求数量", "用量", "qty", "quantity", "count", "number"},
-        "comment": {"comment", "备注", "注释", "规格", "参数", "value"},
-        "value": {"value", "值", "参数值"},
-        "designator": {"designator", "reference", "ref", "位号", "标号", "编号"},
-        "footprint": {"footprint", "package", "封装", "pcb封装"},
-        "manufacturer_part": {"manufacturer part", "manufacturerpart", "mfr part", "mpn", "制造商编号", "厂家型号", "型号"},
-        "manufacturer": {"manufacturer", "厂家", "制造商", "品牌"},
-        "supplier_part": {"supplier part", "supplierpart", "lcsc part", "lcscpart", "立创编号", "供应商编号", "商城编号"},
-        "supplier": {"supplier", "供应商"},
-    }
-    normalized_aliases = {key: {normalized_header(a) for a in aliases} for key, aliases in header_aliases.items()}
-    best = {"score": -1, "row_index": -1, "mapping": {}}
-    for row_index, row in enumerate(rows[:30]):
-        mapping = {}
-        for col_index, cell in enumerate(row):
-            header = normalized_header(cell)
-            if not header:
-                continue
-            for key, aliases in normalized_aliases.items():
-                if header in aliases:
-                    mapping.setdefault(key, col_index)
-        score = len(mapping)
-        if "quantity" in mapping:
-            score += 4
-        if any(key in mapping for key in ("comment", "name", "manufacturer_part", "supplier_part")):
-            score += 3
-        if "designator" in mapping:
-            score += 1
-        if score > best["score"]:
-            best = {"score": score, "row_index": row_index, "mapping": mapping}
-    mapping = best["mapping"]
-    data_rows = rows[best["row_index"] + 1 :] if best["row_index"] >= 0 and "quantity" in mapping else rows
-    if "quantity" not in mapping or not any(key in mapping for key in ("comment", "name", "manufacturer_part", "supplier_part")):
-        mapping = {"name": 0, "quantity": 1, "category": 2}
-        for idx, row in enumerate(rows[:12]):
-            numeric_cols = [i for i, cell in enumerate(row) if find_quantity(cell) > 0]
-            text_cols = [i for i, cell in enumerate(row) if str(cell).strip() and i not in numeric_cols]
-            if numeric_cols and text_cols:
-                mapping = {
-                    "name": text_cols[0],
-                    "quantity": numeric_cols[0],
-                    "category": text_cols[1] if len(text_cols) > 1 else -1,
-                }
-                data_rows = rows[idx:]
-                break
+    table = detect_bom_table(rows)
+    mapping = table["mapping"]
+    data_rows = rows[table["data_start"] :]
     aggregated = {}
     for row in data_rows:
         qty_idx = mapping.get("quantity", 1)
@@ -8529,26 +8570,19 @@ def parse_bom_rows(rows):
                 first_value(row, mapping, ["footprint", "package"]),
             )
         key = bom_group_key(row, mapping)
+        identity = bom_match_identity(row, mapping, category)
         if key not in aggregated:
             aggregated[key] = {
                 "category": category or "未分类",
                 "name": name,
                 "quantity": 0,
-                "aliases": [
-                    first_value(row, mapping, ["comment", "value", "name"]),
-                    first_value(row, mapping, ["manufacturer_part", "part_number"]),
-                    first_value(row, mapping, ["supplier_part", "lcsc_part"]),
-                ]
-                + component_value_aliases(
-                    " ".join(
-                        [
-                            first_value(row, mapping, ["comment", "value", "name"]),
-                            first_value(row, mapping, ["manufacturer_part", "part_number"]),
-                            first_value(row, mapping, ["footprint", "package"]),
-                        ]
-                    ),
-                    category,
-                ),
+                "part_name": identity["part_name"],
+                "value": identity["value"],
+                "package": identity["package"],
+                "lcsc_code": identity["lcsc_code"],
+                "supplier_code": identity["supplier_code"],
+                "manufacturer_part_number": identity["manufacturer_part_number"],
+                "aliases": identity["aliases"],
             }
         aggregated[key]["quantity"] += qty
     return list(aggregated.values())
@@ -8581,24 +8615,81 @@ def component_match_key(value):
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
-def stock_for_item(conn, category, name, aliases=None):
+def normalize_package_code(value):
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    compact = re.sub(r"[^A-Z0-9]+", "", text)
+    if re.fullmatch(r"C\d{4,}", compact) and compact not in COMMON_PACKAGE_CODES:
+        return ""
+
+    def drop_lcsc_code(match):
+        code = match.group(0)
+        return code if code in COMMON_PACKAGE_CODES else ""
+
+    compact = re.sub(r"C\d{4,}", drop_lcsc_code, compact)
+    for code in sorted(PACKAGE_SIZE_CODES, key=len, reverse=True):
+        if code in compact:
+            return code
+    match = re.search(r"(SOT|SOD|SOIC|SOP|TSSOP|MSOP|QFN|DFN|VQFN|LQFP|QFP|DIP|SON|TO)(\d+(?:X\d+)?[A-Z0-9]*)", compact)
+    if match:
+        family = match.group(1)
+        if family == "VQFN":
+            family = "QFN"
+        return family + match.group(2)
+    return ""
+
+
+def extract_package_codes(values):
+    codes = []
+    for value in values:
+        code = normalize_package_code(value)
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def package_only_candidate(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    text = re.sub(r"^(?:封装|package|footprint|pcb\s*package|pcb\s*footprint)\s*[:：]?\s*", "", text, flags=re.I)
+    compact = re.sub(r"[^A-Z0-9]+", "", text.upper())
+    code = normalize_package_code(text)
+    if not code:
+        return False
+    variants = {code, f"C{code}", f"R{code}"}
+    return compact in variants
+
+
+def stock_for_item(conn, category, name, aliases=None, package=None):
     candidates = [name] + list(aliases or [])
     candidates.extend(str(name).split("|"))
-    normalized = {normalize_key(value) for value in candidates if str(value or "").strip()}
-    component_keys = {component_match_key(value) for value in candidates if str(value or "").strip()}
+    requested_packages = set(extract_package_codes([package] + candidates))
+    requested_lcsc_codes = set(extract_lcsc_codes(candidates))
+    match_candidates = [value for value in candidates if not package_only_candidate(value)]
+    normalized = {normalize_key(value) for value in match_candidates if str(value or "").strip()}
+    component_keys = {component_match_key(value) for value in match_candidates if str(value or "").strip()}
     component_keys = {value for value in component_keys if len(value) >= 4}
     value_keys = {
         component_value_key(value, category)
-        for value in candidates
+        for value in match_candidates
         if str(value or "").strip() and component_value_key(value, category)
     }
-    rows = conn.execute("SELECT category, name, quantity FROM inventory").fetchall()
+    rows = conn.execute("SELECT category, name, quantity, note FROM inventory").fetchall()
     total = 0
     for row in rows:
         inv_name = row["name"]
+        inv_note = row["note"] or ""
+        inv_text_values = [inv_name, inv_note]
+        inv_packages = set(extract_package_codes(inv_text_values))
+        inv_lcsc_codes = set(extract_lcsc_codes(inv_text_values))
         inv_norm = normalize_key(inv_name)
         inv_key = component_match_key(inv_name)
         inv_value_key = component_value_key(inv_name, row["category"])
+        exact_lcsc = bool(requested_lcsc_codes and requested_lcsc_codes.intersection(inv_lcsc_codes))
+        if requested_packages and not exact_lcsc and not requested_packages.intersection(inv_packages):
+            continue
         direct = inv_norm in normalized or any(
             len(candidate) >= 4 and (candidate in inv_norm or inv_norm in candidate) for candidate in normalized
         )
@@ -8607,7 +8698,7 @@ def stock_for_item(conn, category, name, aliases=None):
             or any(len(candidate) >= 4 and (candidate in inv_key or inv_key in candidate) for candidate in component_keys)
         )
         value_match = inv_value_key and inv_value_key in value_keys
-        if direct or component or value_match:
+        if exact_lcsc or direct or component or value_match:
             total += int(row["quantity"] or 0)
     return total
 
@@ -9503,7 +9594,13 @@ def process_bom_upload(path, original_name, user, conn=None):
                 """,
                 (upload_id, item["category"], item["name"], item["quantity"], user["username"], created_at),
             )
-            stock = stock_for_item(conn, item["category"], item["name"], item.get("aliases", []))
+            stock = stock_for_item(
+                conn,
+                item["category"],
+                item["name"],
+                item.get("aliases", []),
+                package=item.get("package"),
+            )
             if stock <= item["quantity"]:
                 shortage = item["quantity"] - stock
                 purchase_qty = shortage if shortage > 0 else item["quantity"]
@@ -9722,6 +9819,7 @@ def inventory_changelog_notice_html():
 def render_layout(title, body, user=None, active="", scripts=None):
     config = get_config()
     nav = ""
+    global_notice = ""
     if user:
         items = [
             ("/dashboard", "概览"),
@@ -9746,11 +9844,13 @@ def render_layout(title, body, user=None, active="", scripts=None):
           <div class="account"><span>{html.escape(user["username"])}</span><a href="/logout">退出</a></div>
         </header>
         """
+        global_notice = inventory_changelog_notice_html()
     page_class = "app-shell top-shell" if user else "login-shell"
     page_scripts = render_script_tags([
         "/static/security.js",
         "/static/nav_slime.js",
         "/static/pcb_attach.js",
+        "/static/notice.js",
         *(scripts or []),
     ])
     return f"""<!doctype html>
@@ -9768,6 +9868,7 @@ def render_layout(title, body, user=None, active="", scripts=None):
     {nav}
     <main class="main">{body}</main>
   </div>
+  {global_notice}
   {page_scripts}
 </body>
 </html>"""
@@ -11233,7 +11334,6 @@ def inventory_page(user, query):
     </section>
         """
     body = f"""
-    {inventory_changelog_notice_html()}
     <header class="page-head"><div><p class="eyebrow">Smart Search</p><h1>智能仓库检索</h1></div><div class="page-head-actions"><a class="button" href="/changelog">更新日志</a><a class="button" href="/inventory/new">填写表单</a></div></header>
     <section class="panel smart-search-panel">
       <form class="smart-search-form" method="get" action="/inventory" data-smart-inventory-search>
@@ -11307,9 +11407,9 @@ def new_inventory_page(user, message="", error=""):
           <div class="panel-head compact-head"><h2>2D 位置看板</h2><span id="location-picker-status">逐层点击，自动写入位置</span></div>
           <div class="location-picker-shell">
             <div class="location-stage-wrap">
-              <div class="location-breadcrumb" id="location-breadcrumb">器件盒 / 选择 1-20 号器件盒</div>
+              <div class="location-breadcrumb" id="location-breadcrumb">器件盒 / 选择 1-30 号器件盒</div>
               <div class="location-2d-stage" id="location-2d-stage" aria-label="2D 分层位置选择器"></div>
-              <div class="location-scene-hint">器件盒：先选 1-20 号盒，再选 14 条中的一条，最后选 1-4 号格。柜内：先选 5 层柜子，再选该层 20 个纸盒栏位。</div>
+              <div class="location-scene-hint">器件盒：先选 1-30 号盒，再选 14 条中的一条，最后选 1-4 号格。柜内：先选 5 层柜子，再选该层 20 个纸盒栏位。</div>
             </div>
             <div class="location-picker-controls">
               <div class="location-mode-tabs" role="tablist" aria-label="位置类型">
@@ -11321,7 +11421,7 @@ def new_inventory_page(user, message="", error=""):
                 <span id="location-back-note">当前在顶层视图</span>
               </div>
               <div class="location-config-group" id="location-device-config">
-                <div class="location-config-note">器件盒和柜内纸箱是同级位置类型。器件盒固定 20 个，每个器件盒内部为 14 条 × 4 格，左侧 7 条、右侧 7 条。</div>
+                <div class="location-config-note">器件盒和柜内纸箱是同级位置类型。器件盒固定 30 个，每个器件盒内部为 14 条 × 4 格，左侧 7 条、右侧 7 条。</div>
               </div>
               <div class="location-config-group" id="location-paper-config">
                 <div class="location-config-grid">
@@ -13993,13 +14093,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
     def allowed_request_origins(self):
-        origins = set()
-        allowed_hosts = configured_allowed_hosts()
-        for host in allowed_hosts:
-            if host.startswith("*.") or host == "*":
-                continue
-            origins.add(f"http://{host}")
-            origins.add(f"https://{host}")
+        origins = set(configured_allowed_origins())
         public_url = str(BOOT_CONFIG.get("public_url") or "").strip()
         if public_url:
             parsed = urllib.parse.urlparse(public_url)

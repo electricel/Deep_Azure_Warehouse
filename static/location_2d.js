@@ -21,6 +21,7 @@
   const modeButtons = Array.from(root.querySelectorAll("[data-location-mode]"));
   const deviceConfig = document.getElementById("location-device-config");
   const paperConfig = document.getElementById("location-paper-config");
+  const DEVICE_BOX_COUNT = 30;
 
   const parsedLocation = parseLocation(locationInput.value);
   const state = {
@@ -55,7 +56,7 @@
 
     match = text.match(/^([A-Z]+)(\d{1,2})-(\d{1,2})-(\d{1,2})$/);
     if (match) {
-      const box = clampInt(match[2], 1, 1, 20);
+      const box = clampInt(match[2], 1, 1, DEVICE_BOX_COUNT);
       const strip = clampInt(match[3], 1, 1, 14);
       const cell = clampInt(match[4], 1, 1, 4);
       return {
@@ -118,7 +119,7 @@
   }
 
   function renderDeviceBoxes() {
-    const tiles = Array.from({ length: 20 }, (_, index) => {
+    const tiles = Array.from({ length: DEVICE_BOX_COUNT }, (_, index) => {
       const box = index + 1;
       return createTile({
         title: `${box} 号器件盒`,
@@ -136,7 +137,7 @@
     });
     renderFrame({
       title: "选择器件盒",
-      subtitle: "共 20 个器件盒，选择后进入该盒内部。",
+      subtitle: `共 ${DEVICE_BOX_COUNT} 个器件盒，选择后进入该盒内部。`,
       className: "location-grid-boxes",
       children: tiles,
     });
@@ -270,7 +271,7 @@
 
   function getBreadcrumb() {
     if (state.mode === "device") {
-      if (state.deviceStage === "boxes") return "器件盒 / 选择 1-20 号器件盒";
+      if (state.deviceStage === "boxes") return `器件盒 / 选择 1-${DEVICE_BOX_COUNT} 号器件盒`;
       if (state.deviceStage === "box") return `器件盒 / ${state.deviceBox} 号盒`;
       if (state.deviceStage === "strips") return `器件盒 / ${state.deviceBox} 号盒 / 器件盒内部 / 选择 14 个小条`;
       return `器件盒 / ${state.deviceBox} 号盒 / 第 ${state.deviceStrip} 条 / 选择 1-4 号格`;
