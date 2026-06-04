@@ -17,12 +17,32 @@ import sqlite3
 import subprocess
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
 import xml.etree.ElementTree as ET
+import warehouse_bom as bom_tools
+from warehouse_epro_converter import process_epro_upload
+from warehouse_bom import (
+    COMMON_PACKAGE_CODES,
+    PACKAGE_SIZE_CODES,
+    component_value_aliases,
+    component_value_key,
+    extract_lcsc_codes,
+    infer_category,
+    normalize_key,
+    normalized_header,
+    split_designators,
+)
+
+try:
+    from warehouse_interactive_bom import build_interactive_bom_payload as _build_interactive_bom_payload
+except ImportError:
+    _build_interactive_bom_payload = None
+
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -110,6 +130,8 @@ def load_boot_config():
 
 BOOT_CONFIG = load_boot_config()
 DATA_DIR = Path(os.environ.get("WAREHOUSE_DATA_DIR", BOOT_CONFIG["data_dir"])).resolve()
+LOGS_DIR = BASE_DIR / "logs"
+SERVER_ERRORS_LOG = LOGS_DIR / "server_errors.log"
 DB_PATH = DATA_DIR / "inventory.db"
 DB_ENCRYPTED_PATH = DATA_DIR / "inventory.db.enc"
 FORMS_DIR = DATA_DIR / "forms"
@@ -184,6 +206,7 @@ CSRF_COOKIE_NAME = "csrf_token"
 CSRF_FIELD_NAME = "csrf_token"
 CSRF_HEADER_NAME = "X-CSRF-Token"
 CSRF_TOKEN_TTL_SECONDS = SESSION_TTL_SECONDS
+PCB_PREVIEW_TOKEN_TTL_SECONDS = 60 * 60
 MIN_USER_PASSWORD_LENGTH = 10
 MIN_ADMIN_PASSWORD_LENGTH = 14
 MAX_FORM_BODY_BYTES = 1 * 1024 * 1024
@@ -248,12 +271,15 @@ PCB_ALLOWED_EXTENSIONS = {
     ".drl",
     ".pcb",
     ".kicad_pcb",
+    ".brd",
+    ".fbrd",
     ".html",
     ".htm",
     ".pdf",
     ".json",
     ".txt",
     ".csv",
+    ".epro",
 }
 PCB_GERBER_EXTENSIONS = {".gbr", ".ger", ".gtl", ".gbl", ".gts", ".gbs", ".gto", ".gbo", ".gm1", ".drl"}
 PCB_KIND_LABELS = {
@@ -1759,12 +1785,15 @@ def write_xlsx(path, sheet_name, headers, rows):
     write_data_bytes(path, buffer.getvalue())
 
 
-def inventory_rows(where="", params=(), limit=None):
+def inventory_rows(where="", params=(), limit=None, order_by="recent"):
     query = "SELECT id, created_at, category, name, quantity, location, note, created_by FROM inventory"
     query_params = list(params or [])
     if where:
         query += " WHERE " + where
-    query += " ORDER BY datetime(created_at) DESC, id DESC"
+    if order_by == "location":
+        query += " ORDER BY location COLLATE NOCASE ASC, datetime(created_at) DESC, id DESC"
+    else:
+        query += " ORDER BY datetime(created_at) DESC, id DESC"
     if limit is not None:
         query += " LIMIT ?"
         query_params.append(max(1, parse_int(limit, INVENTORY_SEARCH_RESULT_LIMIT)))
@@ -1932,12 +1961,14 @@ def pcb_upload_kind(extension):
         return "gerber_archive"
     if extension in PCB_GERBER_EXTENSIONS:
         return "gerber_file"
-    if extension in (".pcb", ".kicad_pcb"):
+    if extension in (".pcb", ".kicad_pcb", ".brd", ".fbrd"):
         return "pcb_file"
     if extension in (".html", ".htm"):
         return "html_assistant"
     if extension in PCB_PDF_EXTENSIONS:
         return "schematic_pdf"
+    if extension == ".epro":
+        return "easyeda_pro_project"
     return "support_file"
 
 
@@ -1965,6 +1996,11 @@ def pcb_file_metadata_defaults(item=None, extension="", kind=""):
 
 def pcb_file_kind_label(kind):
     return PCB_KIND_LABELS.get(str(kind or ""), str(kind or "support_file").replace("_", " ").title())
+
+
+PCB_KIND_LABELS.setdefault("easyeda_pro_project", "EasyEDA Pro project")
+PCB_FILE_ROLE_DEFAULTS.setdefault("easyeda_pro_project", "pcb_project")
+PCB_DOCUMENT_TYPE_DEFAULTS.setdefault("easyeda_pro_project", "easyeda_pro_project")
 
 
 def format_file_size(size):
@@ -2080,21 +2116,69 @@ def store_pcb_uploads(bom_id, uploads, user):
         content_type = pcb_upload_mime_type(filename, extension, upload.get("content_type"))
         kind = pcb_upload_kind(extension)
         metadata_defaults = pcb_file_metadata_defaults(extension=extension, kind=kind)
-        stored.append(
-            {
-                "pcb_id": f"pcb_{datetime.now().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(6)}",
-                "original_filename": original,
-                "stored_filename": stored_name,
-                "relative_path": data_relative_path(target),
-                "extension": extension,
-                "mime_type": content_type,
-                "size_bytes": len(content),
-                "sha256": sha256,
-                "uploaded_at": datetime.now().isoformat(timespec="seconds"),
-                "uploaded_by": user["username"],
-                **metadata_defaults,
-            }
-        )
+        item = {
+            "pcb_id": f"pcb_{datetime.now().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(6)}",
+            "original_filename": original,
+            "stored_filename": stored_name,
+            "relative_path": data_relative_path(target),
+            "extension": extension,
+            "mime_type": content_type,
+            "size_bytes": len(content),
+            "sha256": sha256,
+            "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+            "uploaded_by": user["username"],
+            **metadata_defaults,
+        }
+        stored.append(item)
+
+        if extension == ".epro":
+            conversion = process_epro_upload(
+                content,
+                original,
+                os.environ.get("WAREHOUSE_EPRO_CONVERTER_CMD", ""),
+            )
+            item["processing_status"] = conversion.status
+            item["conversion_status"] = conversion.status
+            item["conversion_message"] = conversion.message
+            item["conversion_diagnostics"] = conversion.diagnostics
+            item["derived_file_count"] = len(conversion.generated_files)
+            for generated in conversion.generated_files:
+                generated_filename = safe_name(generated.filename)
+                generated_extension = Path(generated_filename).suffix.lower()
+                if generated_extension not in PCB_ALLOWED_EXTENSIONS or generated_extension == ".epro":
+                    continue
+                generated_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                generated_token = secrets.token_hex(4)
+                generated_stored_name = f"{generated_stamp}_{generated_token}_{generated_filename}"
+                generated_target = upload_dir / generated_stored_name
+                generated_counter = 1
+                while generated_target.exists():
+                    generated_stored_name = f"{generated_stamp}_{generated_token}_{generated_counter}_{generated_filename}"
+                    generated_target = upload_dir / generated_stored_name
+                    generated_counter += 1
+                write_data_bytes(generated_target, generated.content)
+                generated_kind = pcb_upload_kind(generated_extension)
+                generated_defaults = pcb_file_metadata_defaults(extension=generated_extension, kind=generated_kind)
+                stored.append(
+                    {
+                        "pcb_id": f"pcb_{datetime.now().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(6)}",
+                        "original_filename": generated_filename,
+                        "stored_filename": generated_stored_name,
+                        "relative_path": data_relative_path(generated_target),
+                        "extension": generated_extension,
+                        "mime_type": pcb_upload_mime_type(generated_filename, generated_extension),
+                        "size_bytes": len(generated.content),
+                        "sha256": hashlib.sha256(generated.content).hexdigest(),
+                        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+                        "uploaded_by": user["username"],
+                        "derived_from_pcb_id": item["pcb_id"],
+                        "derived_from_filename": original,
+                        "conversion_source": generated.source,
+                        "conversion_note": generated.note,
+                        **generated_defaults,
+                        "processing_status": "converted",
+                    }
+                )
     return stored
 
 
@@ -2559,6 +2643,24 @@ def pcb_file_metadata_id(item):
     return ""
 
 
+def pcb_file_is_internal_ibom_html(item, extension=""):
+    if not isinstance(item, dict):
+        return False
+    extension = str(extension or item.get("extension") or "").lower()
+    if not extension:
+        extension = Path(str(item.get("stored_filename") or item.get("original_filename") or "")).suffix.lower()
+    if extension not in (".html", ".htm"):
+        return False
+    filename = str(item.get("original_filename") or item.get("stored_filename") or "").lower()
+    if str(item.get("conversion_source") or "") == "internal_epcb_parser":
+        return True
+    return (
+        filename.endswith(".ibom.html")
+        and bool(item.get("derived_from_pcb_id"))
+        and str(item.get("processing_status") or "").lower() == "converted"
+    )
+
+
 def find_pcb_file_metadata(record, pcb_file_id):
     target = str(pcb_file_id or "").strip()
     if not target:
@@ -2572,6 +2674,64 @@ def find_pcb_file_metadata(record, pcb_file_id):
 
 def pcb_file_view_url(bom_id, pcb_file_id):
     return f"/pcb/{urllib.parse.quote(str(bom_id or ''))}/{urllib.parse.quote(str(pcb_file_id or ''))}"
+
+
+def pcb_preview_token_secret():
+    key = data_encryption_key(required=False)
+    if key:
+        return key
+    seed = "|".join(
+        [
+            str(DEFAULT_PASSWORD or ""),
+            str(CONFIG_PATH.resolve()),
+            str(DATA_DIR.resolve()),
+            str(APP_ENV or ""),
+        ]
+    )
+    return hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+
+
+def user_username_value(user):
+    if not user:
+        return ""
+    if isinstance(user, dict):
+        return str(user.get("username") or "")
+    try:
+        return str(user["username"] or "")
+    except Exception:
+        return str(getattr(user, "username", "") or "")
+
+
+def make_pcb_preview_token(bom_id, pcb_file_id, user=None, now=None):
+    expires = int((now or time.time()) + PCB_PREVIEW_TOKEN_TTL_SECONDS)
+    username = user_username_value(user)
+    payload = "|".join([str(bom_id or ""), str(pcb_file_id or ""), str(expires), username])
+    signature = hmac.new(pcb_preview_token_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{expires}.{urllib.parse.quote(username, safe='')}.{signature}"
+
+
+def verify_pcb_preview_token(token, bom_id, pcb_file_id, user=None, now=None):
+    parts = str(token or "").split(".", 2)
+    if len(parts) != 3:
+        return False
+    expires_text, username_quoted, signature = parts
+    if not re.fullmatch(r"\d{9,12}", expires_text or ""):
+        return False
+    expires = int(expires_text)
+    if expires < int(now or time.time()):
+        return False
+    username = urllib.parse.unquote(username_quoted or "")
+    if user is not None and username and username != user_username_value(user):
+        return False
+    payload = "|".join([str(bom_id or ""), str(pcb_file_id or ""), str(expires), username])
+    expected = hmac.new(pcb_preview_token_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def pcb_file_preview_url(bom_id, pcb_file_id, user=None):
+    base = pcb_file_view_url(bom_id, pcb_file_id)
+    token = make_pcb_preview_token(bom_id, pcb_file_id, user=user)
+    return base + "?preview_token=" + urllib.parse.quote(token, safe="")
 
 
 def soldering_workbench_url(bom_id, pcb_file_id=""):
@@ -7305,167 +7465,6 @@ def payload_value(data, *keys, default=""):
     return default
 
 
-def normalize_key(value):
-    return re.sub(r"\s+", "", str(value or "").strip().lower())
-
-
-def normalize_ohm_text(value):
-    text = str(value or "").strip().lower()
-    return (
-        text.replace("ω", "Ω")
-        .replace("ohms", "Ω")
-        .replace("ohm", "Ω")
-        .replace("欧姆", "Ω")
-        .replace("欧", "Ω")
-    )
-
-
-def format_resistance(ohms):
-    value = float(ohms)
-    if value >= 1_000_000 and value % 1_000_000 == 0:
-        return f"{int(value / 1_000_000)}MΩ"
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:g}MΩ"
-    if value >= 1_000 and value % 1_000 == 0:
-        return f"{int(value / 1_000)}kΩ"
-    if value >= 1_000:
-        return f"{value / 1_000:g}kΩ"
-    return f"{value:g}Ω"
-
-
-def parse_resistance_value(value):
-    text = normalize_ohm_text(value)
-    match = re.search(r"(\d+(?:\.\d+)?)([kmr]?)(?:Ω|r\b)?", text, re.I)
-    if match and ("Ω" in text or match.group(2).lower() in ("k", "m", "r")):
-        number = float(match.group(1))
-        unit = match.group(2).lower()
-        if unit == "m":
-            number *= 1_000_000
-        elif unit == "k":
-            number *= 1_000
-        return round(number, 6)
-    compact = re.search(r"(\d+)r(\d+)", text, re.I)
-    if compact:
-        return float(f"{compact.group(1)}.{compact.group(2)}")
-    compact = re.search(r"(\d+)k(\d+)", text, re.I)
-    if compact:
-        return float(f"{compact.group(1)}.{compact.group(2)}") * 1_000
-    compact = re.search(r"(\d+)m(\d+)", text, re.I)
-    if compact:
-        return float(f"{compact.group(1)}.{compact.group(2)}") * 1_000_000
-    return None
-
-
-def decode_resistor_code(value):
-    text = str(value or "").upper()
-    ignored_packages = {"0201", "0402", "0603", "0805", "1206", "1210", "1812", "2512"}
-    codes = [m.group(0) for m in re.finditer(r"\d{3,4}", text) if m.group(0) not in ignored_packages]
-    if not codes:
-        return None
-    code = codes[-1]
-    if len(code) == 3:
-        base = int(code[:2])
-        multiplier = int(code[2])
-    else:
-        base = int(code[:3])
-        multiplier = int(code[3])
-    return float(base * (10 ** multiplier))
-
-
-def decode_capacitor_code(value):
-    text = str(value or "").upper()
-    ignored_packages = {"0201", "0402", "0603", "0805", "1206", "1210", "1812"}
-    codes = [m.group(0) for m in re.finditer(r"\d{3}", text) if m.group(0) not in ignored_packages]
-    if not codes:
-        return None
-    code = codes[-1]
-    pf = int(code[:2]) * (10 ** int(code[2]))
-    if pf >= 1_000_000:
-        return f"{pf / 1_000_000:g}uF"
-    if pf >= 1_000:
-        return f"{pf / 1_000:g}nF"
-    return f"{pf:g}pF"
-
-
-def component_value_key(value, category=""):
-    text = normalize_ohm_text(value)
-    cat = str(category or "")
-    resistance = parse_resistance_value(text)
-    if resistance is None and ("电阻" in cat or re.search(r"(^|[^A-Z])R\d{4}", str(value or "").upper())):
-        resistance = decode_resistor_code(value)
-    if resistance is not None:
-        return f"R:{resistance:g}"
-    cap_match = re.search(r"(\d+(?:\.\d+)?)(p|n|u|µ)f", text, re.I)
-    if cap_match:
-        number = float(cap_match.group(1))
-        unit = cap_match.group(2).lower().replace("µ", "u")
-        if unit == "p":
-            farads = number * 1e-12
-        elif unit == "n":
-            farads = number * 1e-9
-        else:
-            farads = number * 1e-6
-        return f"C:{farads:.12g}"
-    decoded_cap = decode_capacitor_code(value) if "电容" in cat else None
-    if decoded_cap:
-        return component_value_key(decoded_cap, "电容")
-    return ""
-
-
-def component_value_aliases(value, category=""):
-    aliases = []
-    resistance = parse_resistance_value(value)
-    if resistance is None and "电阻" in str(category or ""):
-        resistance = decode_resistor_code(value)
-    if resistance is not None:
-        aliases.append(format_resistance(resistance))
-        aliases.append(format_resistance(resistance).replace("Ω", "欧姆"))
-        if resistance >= 1_000:
-            aliases.append(f"{resistance / 1_000:g}K")
-        else:
-            aliases.append(f"{resistance:g}R")
-    decoded_cap = decode_capacitor_code(value) if "电容" in str(category or "") else None
-    if decoded_cap:
-        aliases.append(decoded_cap)
-    return aliases
-
-
-COMMON_PACKAGE_CODES = {
-    "C0201",
-    "C0402",
-    "C0603",
-    "C0805",
-    "C1206",
-    "C1210",
-    "C1812",
-    "C2220",
-}
-
-PACKAGE_SIZE_CODES = {
-    "0201",
-    "0402",
-    "0603",
-    "0805",
-    "1206",
-    "1210",
-    "1812",
-    "2010",
-    "2512",
-    "2220",
-}
-
-
-def extract_lcsc_codes(values):
-    codes = set()
-    for value in values:
-        for match in re.findall(r"\bC\d{4,}\b", str(value or ""), re.I):
-            code = match.upper()
-            if code in COMMON_PACKAGE_CODES:
-                continue
-            codes.add(code)
-    return sorted(codes)
-
-
 def load_lcsc_cache():
     if not LCSC_CACHE_JSON.exists():
         return {}
@@ -8175,437 +8174,23 @@ def cleanup_analytics_noise():
 
 
 def read_text_rows(path):
-    data = read_data_bytes(path)
-    text = None
-    for encoding in ("utf-8-sig", "gbk", "utf-16"):
-        try:
-            text = data.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = data.decode("utf-8", errors="replace")
-    sample = text[:2048]
-    if "\t" in sample:
-        delimiter = "\t"
-    elif "," in sample:
-        delimiter = ","
-    else:
-        delimiter = None
-    if delimiter:
-        return [row for row in csv.reader(text.splitlines(), delimiter=delimiter) if any(c.strip() for c in row)]
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            rows.append(re.split(r"\s{2,}|\s+\|\s+|\s*,\s*", line))
-    return rows
+    return bom_tools.read_text_rows(path, read_bytes=read_data_bytes)
 
 
 def read_xlsx_rows(path):
-    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    with zipfile.ZipFile(io.BytesIO(read_data_bytes(path))) as zf:
-        shared = []
-        if "xl/sharedStrings.xml" in zf.namelist():
-            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-            for si in root.findall("m:si", ns):
-                texts = [t.text or "" for t in si.findall(".//m:t", ns)]
-                shared.append("".join(texts))
-        sheet_name = "xl/worksheets/sheet1.xml"
-        if sheet_name not in zf.namelist():
-            sheet_name = next((n for n in zf.namelist() if n.startswith("xl/worksheets/") and n.endswith(".xml")), "")
-        if not sheet_name:
-            return []
-        root = ET.fromstring(zf.read(sheet_name))
-    rows = []
-    for row in root.findall(".//m:row", ns):
-        values = []
-        max_col = 0
-        for cell in row.findall("m:c", ns):
-            ref = cell.attrib.get("r", "")
-            letters = "".join(ch for ch in ref if ch.isalpha())
-            col = 0
-            for ch in letters:
-                col = col * 26 + ord(ch.upper()) - 64
-            max_col = max(max_col, col)
-            while len(values) < col - 1:
-                values.append("")
-            ctype = cell.attrib.get("t")
-            value = ""
-            if ctype == "inlineStr":
-                texts = [t.text or "" for t in cell.findall(".//m:t", ns)]
-                value = "".join(texts)
-            else:
-                node = cell.find("m:v", ns)
-                if node is not None and node.text is not None:
-                    value = shared[int(node.text)] if ctype == "s" and node.text.isdigit() else node.text
-            values.append(value)
-        if any(str(v).strip() for v in values):
-            rows.append(values[:max_col])
-    return rows
+    return bom_tools.read_xlsx_rows(path, read_bytes=read_data_bytes)
 
 
 def read_bom_file_rows(path):
-    suffix = path.suffix.lower()
-    if suffix == ".xlsx":
-        return read_xlsx_rows(path)
-    if suffix in (".csv", ".txt"):
-        return read_text_rows(path)
-    raise ValueError("\u4ec5\u652f\u6301 csv\u3001xlsx\u3001txt \u6587\u4ef6\u3002")
-
-
-def find_quantity(value):
-    text = str(value or "").replace(",", "").strip()
-    match = re.search(r"-?\d+", text)
-    return max(0, int(match.group(0))) if match else 0
-
-
-def normalized_header(value):
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").strip().lower())
-
-
-def first_value(row, mapping, keys):
-    for key in keys:
-        idx = mapping.get(key)
-        if idx is not None and 0 <= idx < len(row):
-            value = str(row[idx] or "").strip()
-            if value:
-                return value
-    return ""
-
-
-BOM_HEADER_ALIASES = {
-    "category": {"category", "class", "type", "\u7c7b\u522b", "\u5546\u54c1\u7c7b\u522b", "\u7c7b\u578b"},
-    "name": {
-        "name",
-        "item",
-        "part",
-        "part name",
-        "component",
-        "description",
-        "\u540d\u79f0",
-        "\u5546\u54c1\u540d\u79f0",
-        "\u5668\u4ef6",
-        "\u5668\u4ef6\u540d\u79f0",
-        "\u7269\u6599",
-        "\u7269\u6599\u540d\u79f0",
-        "\u578b\u53f7",
-    },
-    "quantity": {"qty", "quantity", "count", "number", "\u6570\u91cf", "\u9700\u6c42\u6570\u91cf", "\u7528\u91cf"},
-    "comment": {"comment", "comments", "remark", "remarks", "note", "\u5907\u6ce8", "\u6ce8\u91ca", "\u89c4\u683c", "\u53c2\u6570", "value"},
-    "value": {"value", "\u503c", "\u53c2\u6570\u503c"},
-    "designator": {"designator", "designators", "reference", "references", "ref", "refs", "refdes", "ref des", "\u4f4d\u53f7", "\u6807\u53f7", "\u7f16\u53f7"},
-    "footprint": {"footprint", "footprints", "package", "pcb footprint", "pcb package", "\u5c01\u88c5", "pcb\u5c01\u88c5"},
-    "manufacturer_part": {
-        "manufacturer part",
-        "manufacturerpart",
-        "mfr part",
-        "mfr pn",
-        "mpn",
-        "part number",
-        "partnumber",
-        "\u5236\u9020\u5546\u7f16\u53f7",
-        "\u5382\u5bb6\u578b\u53f7",
-        "\u578b\u53f7",
-    },
-    "manufacturer": {"manufacturer", "mfr", "brand", "\u5382\u5bb6", "\u5236\u9020\u5546", "\u54c1\u724c"},
-    "supplier_part": {
-        "supplier part",
-        "supplierpart",
-        "supplier code",
-        "lcsc",
-        "lcsc part",
-        "lcscpart",
-        "lcsc code",
-        "jlcpcb part",
-        "\u7acb\u521b\u7f16\u53f7",
-        "\u7acb\u521b\u5546\u57ce\u7f16\u53f7",
-        "\u4f9b\u5e94\u5546\u7f16\u53f7",
-        "\u5546\u57ce\u7f16\u53f7",
-    },
-    "supplier": {"supplier", "\u4f9b\u5e94\u5546"},
-}
-
-
-def detect_bom_table(rows):
-    normalized_aliases = {key: {normalized_header(a) for a in aliases} for key, aliases in BOM_HEADER_ALIASES.items()}
-    best = {"score": -1, "row_index": -1, "mapping": {}}
-    for row_index, row in enumerate(rows[:30]):
-        mapping = {}
-        for col_index, cell in enumerate(row):
-            header = normalized_header(cell)
-            if not header:
-                continue
-            for key, aliases in normalized_aliases.items():
-                if header in aliases:
-                    mapping.setdefault(key, col_index)
-        score = len(mapping)
-        if "quantity" in mapping:
-            score += 4
-        if any(key in mapping for key in ("comment", "name", "manufacturer_part", "supplier_part")):
-            score += 3
-        if "designator" in mapping:
-            score += 1
-        if score > best["score"]:
-            best = {"score": score, "row_index": row_index, "mapping": mapping}
-
-    mapping = best["mapping"]
-    header_index = best["row_index"]
-    data_start = header_index + 1 if header_index >= 0 and "quantity" in mapping else 0
-    if "quantity" not in mapping or not any(key in mapping for key in ("comment", "name", "manufacturer_part", "supplier_part")):
-        mapping = {"name": 0, "quantity": 1, "category": 2}
-        header_index = -1
-        data_start = 0
-        for idx, row in enumerate(rows[:12]):
-            numeric_cols = [i for i, cell in enumerate(row) if find_quantity(cell) > 0]
-            text_cols = [i for i, cell in enumerate(row) if str(cell).strip() and i not in numeric_cols]
-            if numeric_cols and text_cols:
-                mapping = {
-                    "name": text_cols[0],
-                    "quantity": numeric_cols[0],
-                    "category": text_cols[1] if len(text_cols) > 1 else -1,
-                }
-                data_start = idx
-                break
-    headers = rows[header_index] if 0 <= header_index < len(rows) else []
-    return {"mapping": mapping, "header_index": header_index, "data_start": data_start, "headers": headers}
-
-
-def bom_original_row_data(row, headers):
-    result = {}
-    for idx, value in enumerate(row):
-        key = str(headers[idx]).strip() if idx < len(headers) and str(headers[idx]).strip() else f"column_{idx + 1}"
-        if key in result:
-            key = f"{key}_{idx + 1}"
-        result[key] = value
-    return result
-
-
-def split_designators(value):
-    text = str(value or "").strip()
-    if not text:
-        return []
-    text = text.replace("\uff0c", ",").replace("\u3001", ",").replace(";", ",")
-    return [part.strip() for part in re.split(r"[\s,]+", text) if part.strip()]
-
-
-def normalize_bom_component_rows(rows):
-    table = detect_bom_table(rows)
-    mapping = table["mapping"]
-    headers = table["headers"]
-    components = []
-    for offset, row in enumerate(rows[table["data_start"] :]):
-        row_index = table["data_start"] + offset
-        qty_idx = mapping.get("quantity", 1)
-        if qty_idx >= len(row):
-            continue
-        quantity = find_quantity(row[qty_idx])
-        if quantity <= 0:
-            continue
-        normalized_name = build_bom_item_name(row, mapping)
-        if not normalized_name or normalized_header(normalized_name) in (
-            "name",
-            "\u540d\u79f0",
-            "\u5546\u54c1\u540d\u79f0",
-            "\u5668\u4ef6\u540d\u79f0",
-            "comment",
-            "manufacturerpart",
-        ):
-            continue
-        designator = first_value(row, mapping, ["designator", "reference"])
-        value = first_value(row, mapping, ["value", "comment"])
-        part_name = first_value(row, mapping, ["name", "comment", "manufacturer_part", "supplier_part"])
-        package = first_value(row, mapping, ["footprint", "package"])
-        manufacturer_part = first_value(row, mapping, ["manufacturer_part", "part_number"])
-        supplier_part = first_value(row, mapping, ["supplier_part", "lcsc_part"])
-        lcsc_codes = extract_lcsc_codes([supplier_part] + [str(cell) for cell in row])
-        category = first_value(row, mapping, ["category"]) or infer_category(value or part_name, designator, package)
-        components.append(
-            {
-                "row_index": row_index + 1,
-                "designators": split_designators(designator),
-                "designator": designator,
-                "part_name": part_name,
-                "value": value,
-                "package": package,
-                "quantity": quantity,
-                "lcsc_code": lcsc_codes[0] if lcsc_codes else "",
-                "supplier_code": supplier_part,
-                "manufacturer_part_number": manufacturer_part,
-                "manufacturer": first_value(row, mapping, ["manufacturer"]),
-                "category": category,
-                "normalized_name": normalized_name,
-                "aliases": [
-                    alias
-                    for alias in [
-                        value,
-                        part_name,
-                        manufacturer_part,
-                        supplier_part,
-                    ]
-                    if alias
-                ],
-                "original_row": {
-                    "values": row,
-                    "data": bom_original_row_data(row, headers),
-                },
-            }
-        )
-    return components
-
-
-def infer_category(comment="", designator="", footprint=""):
-    designator = str(designator or "").strip().upper()
-    footprint = str(footprint or "").strip().upper()
-    comment = str(comment or "").strip().upper()
-    token = ""
-    if designator:
-        token = re.split(r"[\s,\-]+", designator)[0]
-    if "TEST-POINT" in footprint or "TEST-POINT" in comment:
-        return "测试点"
-    if token.startswith(("CN", "J", "P")) or "CONN" in footprint or "WAFER" in comment:
-        return "连接器"
-    if token.startswith("C") or footprint.startswith("C0") or "CAP" in footprint:
-        return "电容"
-    if token.startswith("R") or footprint.startswith("R0") or re.search(r"\d+(\.\d+)?[KMR]?Ω", comment):
-        return "电阻"
-    if token.startswith("L"):
-        return "电感"
-    if token.startswith("D"):
-        return "二极管"
-    if token.startswith("U") or token.startswith("IC"):
-        return "IC"
-    if token.startswith("Q"):
-        return "晶体管"
-    if token.startswith("F") or "FUSE" in footprint:
-        return "保险丝"
-    if token.startswith("Y") or "CRYSTAL" in footprint:
-        return "晶振"
-    return "未分类"
-
-
-def build_bom_item_name(row, mapping):
-    comment = first_value(row, mapping, ["comment", "value", "name"])
-    manufacturer_part = first_value(row, mapping, ["manufacturer_part", "part_number", "name"])
-    supplier_part = first_value(row, mapping, ["supplier_part", "lcsc_part"])
-    footprint = first_value(row, mapping, ["footprint", "package"])
-    designator = first_value(row, mapping, ["designator", "reference"])
-    category = infer_category(comment, designator, footprint)
-    base = manufacturer_part or comment or supplier_part
-    parts = [base]
-    translated = component_value_aliases(manufacturer_part, category)
-    if translated and translated[0] not in (comment, base):
-        parts.append(f"转译:{translated[0]}")
-    if comment and comment != base:
-        parts.append(f"规格:{comment}")
-    if footprint:
-        parts.append(f"封装:{footprint}")
-    if supplier_part:
-        parts.append(f"LCSC:{supplier_part}")
-    if designator:
-        parts.append(f"位号:{designator}")
-    return " | ".join(part for part in parts if part)
-
-
-def bom_group_key(row, mapping):
-    supplier_part = first_value(row, mapping, ["supplier_part", "lcsc_part"])
-    manufacturer_part = first_value(row, mapping, ["manufacturer_part", "part_number"])
-    comment = first_value(row, mapping, ["comment", "value", "name"])
-    footprint = first_value(row, mapping, ["footprint", "package"])
-    if supplier_part:
-        return ("supplier", normalize_key(supplier_part))
-    if manufacturer_part:
-        return ("mpn", normalize_key(manufacturer_part), normalize_key(footprint))
-    return ("generic", normalize_key(comment), normalize_key(footprint))
-
-
-def bom_match_identity(row, mapping, category):
-    value = first_value(row, mapping, ["value", "comment", "name"])
-    part_name = first_value(row, mapping, ["name", "comment", "manufacturer_part", "supplier_part"])
-    package = first_value(row, mapping, ["footprint", "package"])
-    manufacturer_part = first_value(row, mapping, ["manufacturer_part", "part_number"])
-    supplier_part = first_value(row, mapping, ["supplier_part", "lcsc_part"])
-    aliases = [
-        value,
-        part_name,
-        manufacturer_part,
-        supplier_part,
-    ] + component_value_aliases(
-        " ".join([value, manufacturer_part, package]),
-        category,
-    )
-    return {
-        "part_name": part_name,
-        "value": value,
-        "package": package,
-        "manufacturer_part_number": manufacturer_part,
-        "supplier_code": supplier_part,
-        "lcsc_code": (extract_lcsc_codes([supplier_part]) or [""])[0],
-        "aliases": list(dict.fromkeys(alias for alias in aliases if alias)),
-    }
-
-
-def parse_bom_rows(rows):
-    if not rows:
-        return []
-    table = detect_bom_table(rows)
-    mapping = table["mapping"]
-    data_rows = rows[table["data_start"] :]
-    aggregated = {}
-    for row in data_rows:
-        qty_idx = mapping.get("quantity", 1)
-        if qty_idx >= len(row):
-            continue
-        qty = find_quantity(row[qty_idx])
-        if qty <= 0:
-            continue
-        name = build_bom_item_name(row, mapping)
-        if not name or normalized_header(name) in ("name", "名称", "商品名称", "器件名称", "comment", "manufacturerpart"):
-            continue
-        category = first_value(row, mapping, ["category"])
-        if not category:
-            category = infer_category(
-                first_value(row, mapping, ["comment", "value", "name"]),
-                first_value(row, mapping, ["designator", "reference"]),
-                first_value(row, mapping, ["footprint", "package"]),
-            )
-        key = bom_group_key(row, mapping)
-        identity = bom_match_identity(row, mapping, category)
-        if key not in aggregated:
-            aggregated[key] = {
-                "category": category or "未分类",
-                "name": name,
-                "quantity": 0,
-                "part_name": identity["part_name"],
-                "value": identity["value"],
-                "package": identity["package"],
-                "lcsc_code": identity["lcsc_code"],
-                "supplier_code": identity["supplier_code"],
-                "manufacturer_part_number": identity["manufacturer_part_number"],
-                "aliases": identity["aliases"],
-            }
-        aggregated[key]["quantity"] += qty
-    return list(aggregated.values())
+    return bom_tools.read_bom_file_rows(path, read_bytes=read_data_bytes)
 
 
 def parse_bom_file(path):
-    rows = read_bom_file_rows(path)
-    items = parse_bom_rows(rows)
-    if not items:
-        raise ValueError("未读取到有效器件，请确认文件包含名称和数量列。")
-    return items
+    return bom_tools.parse_bom_file(path, read_bytes=read_data_bytes)
 
 
 def parse_bom_file_detail(path):
-    rows = read_bom_file_rows(path)
-    items = parse_bom_rows(rows)
-    if not items:
-        raise ValueError("未读取到有效器件，请确认文件包含名称和数量列。")
-    return {
-        "raw_rows": rows,
-        "component_rows": normalize_bom_component_rows(rows),
-        "items": items,
-    }
+    return bom_tools.parse_bom_file_detail(path, read_bytes=read_data_bytes)
 
 
 def component_match_key(value):
@@ -9408,39 +8993,81 @@ def bom_component_match_tokens(item):
     return tokens
 
 
+def safe_json_script_payload(payload):
+    return json.dumps(payload if payload is not None else {}, ensure_ascii=False).replace("<", "\\u003c")
+
+
+def fallback_interactive_bom_payload(record):
+    decorated = decorate_bom_record(record)
+    component_rows = decorated.get("component_rows") if isinstance(decorated.get("component_rows"), list) else []
+    if not component_rows:
+        component_rows = decorated.get("aggregated_items") if isinstance(decorated.get("aggregated_items"), list) else []
+    components = []
+    for idx, item in enumerate(component_rows, start=1):
+        if not isinstance(item, dict):
+            continue
+        refs = item.get("designators") if isinstance(item.get("designators"), list) else split_designators(item.get("designator"))
+        components.append(
+            {
+                "id": f"fallback-{idx}",
+                "row_id": f"bomrow-{idx}",
+                "index": idx,
+                "refs": refs,
+                "ref": refs[0] if refs else "",
+                "name": item.get("part_name") or item.get("normalized_name") or item.get("name") or item.get("value") or "",
+                "value": item.get("value") or "",
+                "footprint": item.get("package") or item.get("footprint") or "",
+                "quantity": parse_int(item.get("quantity"), 0),
+                "lcsc_code": item.get("lcsc_code") or item.get("supplier_code") or "",
+                "side": "top",
+                "bbox": {
+                    "x": ((idx * 37) % 92) + 4,
+                    "y": ((idx * 53) % 84) + 8,
+                    "width": 7,
+                    "height": 5,
+                    "source": "fallback",
+                },
+                "row_index": idx,
+                "tokens": bom_component_match_tokens(item),
+            }
+        )
+    return {
+        "version": 1,
+        "source": "app-fallback",
+        "bom_id": str(decorated.get("bom_id") or ""),
+        "original_filename": decorated.get("original_filename") or "",
+        "components": components,
+        "pcb_files": decorated.get("pcb_files") if isinstance(decorated.get("pcb_files"), list) else [],
+        "latest_pcb_file": decorated.get("latest_pcb_file") or {},
+    }
+
+
+def interactive_bom_payload_for_record(record):
+    if callable(_build_interactive_bom_payload):
+        try:
+            payload = _build_interactive_bom_payload(record)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as exc:
+            bom_id = ""
+            if isinstance(record, dict):
+                bom_id = record.get("bom_id") or ""
+            else:
+                try:
+                    bom_id = record["bom_id"] or ""
+                except Exception:
+                    pass
+            print(f"[interactive bom] failed to build payload for {bom_id}: {exc}")
+    return fallback_interactive_bom_payload(record)
+
+
 def render_soldering_workbench(user, record, pcb_file=None):
     decorated = decorate_bom_record(record)
     bom_id = str(decorated.get("bom_id") or "")
     selected_pcb = pcb_file or decorated.get("latest_pcb_file") or {}
     selected_pcb_id = str(selected_pcb.get("pcb_id") or selected_pcb.get("pcb_file_id") or selected_pcb.get("id") or "")
-    component_rows = decorated.get("component_rows") if isinstance(decorated.get("component_rows"), list) else []
-    if not component_rows:
-        component_rows = decorated.get("aggregated_items") if isinstance(decorated.get("aggregated_items"), list) else []
-    bom_rows = []
-    marker_rows = []
-    marker_index = 0
-    for idx, item in enumerate(component_rows[:300], start=1):
-        if not isinstance(item, dict):
-            continue
-        refs = item.get("designators") if isinstance(item.get("designators"), list) else split_designators(item.get("designator"))
-        refs_text = ", ".join(refs[:18])
-        tokens = " ".join(bom_component_match_tokens(item))
-        row_id = f"bomrow-{idx}"
-        name = str(item.get("part_name") or item.get("normalized_name") or item.get("name") or item.get("value") or "-")
-        marker_refs = refs if refs else [str(idx)]
-        for ref in marker_refs:
-            marker_index += 1
-            marker_rows.append(
-                f'<button class="pcb-marker" type="button" data-row="{row_id}" data-tokens="{html.escape(tokens)}" '
-                f'style="--x:{(marker_index * 37) % 92 + 4}%;--y:{(marker_index * 53) % 84 + 8}%;" title="{html.escape(refs_text or name)}">'
-                f'{html.escape(str(ref)[:8])}</button>'
-            )
-        bom_rows.append(
-            f'<tr data-row="{row_id}" data-tokens="{html.escape(tokens)}">'
-            f'<td>{idx}</td><td>{html.escape(refs_text or "-")}</td><td>{html.escape(name)}</td>'
-            f'<td>{html.escape(str(item.get("package") or "-"))}</td><td>{parse_int(item.get("quantity"), 0)}</td>'
-            f'<td>{html.escape(str(item.get("lcsc_code") or item.get("supplier_code") or "-"))}</td></tr>'
-        )
+    interactive_payload = interactive_bom_payload_for_record(record)
+    interactive_payload_json = safe_json_script_payload(interactive_payload)
     pcb_options = []
     for item in decorated.get("pcb_files", []):
         pid = str(item.get("pcb_id") or "")
@@ -9458,11 +9085,18 @@ def render_soldering_workbench(user, record, pcb_file=None):
         completed_job, completed_consumption = soldering_consumption_for_job_id(completed_job_id, user)
         if completed_job and completed_job.get("status") == SOLDERING_COMPLETED_STATUS:
             completed_consumption_html = soldering_consumption_summary_html(completed_consumption)
-    iframe_html = ""
+    preview_html = ""
     if selected_pcb and selected_pcb.get("view_url"):
-        iframe_html = f'<iframe class="pcb-file-frame" src="{html.escape(selected_pcb["view_url"])}" title="PCB 文件预览"></iframe>'
+        preview_url = pcb_file_preview_url(bom_id, selected_pcb_id, user) if selected_pcb_id else selected_pcb["view_url"]
+        preview_html = (
+            '<div class="pcb-preview-actions">'
+            '<div><strong>已关联 PCB 预览</strong>'
+            '<small>在新标签页打开生成的 HTML / PDF / Gerber 预览文件。</small></div>'
+            f'<a class="button" href="{html.escape(preview_url, quote=True)}" target="_blank" rel="noopener">打开预览</a>'
+            "</div>"
+        )
     else:
-        iframe_html = '<div class="empty">还没有关联 PCB/HTML/Gerber 文件。</div>'
+        preview_html = '<div class="empty">还没有关联 PCB / HTML / Gerber 文件。</div>'
     selected_label = selected_pcb.get("original_filename") or "未选择文件"
     selected_status_text = selected_pcb.get("status_text") or pcb_file_compact_status(selected_pcb)
     selected_analysis_action = ""
@@ -9513,6 +9147,7 @@ def render_soldering_workbench(user, record, pcb_file=None):
         f'<span data-analysis-status>{html.escape(selected_status_text or "暂无附件元数据")}</span>'
         f'{selected_analysis_action}</div>'
     )
+    pcb_upload_html = bom_pcb_upload_form_html(decorated)
     analysis_history_panel = analysis_workbench_history_panel_html(user, decorated, selected_pcb_id)
     analysis_root_attrs = ""
     if selected_analysis_is_pdf:
@@ -9533,30 +9168,33 @@ def render_soldering_workbench(user, record, pcb_file=None):
       <section class="panel soldering-controls">
         <div class="panel-head"><h2>焊接状态</h2><span id="soldering-status">{html.escape(active_job.get("status") or decorated.get("status") or "awaiting_start")}</span></div>
         <label>PCB 文件<select id="pcb-file-id">{''.join(pcb_options) or '<option value="">无 PCB 文件</option>'}</select></label>
+        <div class="soldering-pcb-upload">
+          <strong>上传 PCB / .epro</strong>
+          {pcb_upload_html}
+        </div>
         <label>本次制板数量<input id="board-count" type="number" min="1" value="{html.escape(str(active_job.get("board_count") or decorated.get("soldering_board_count") or 1))}"></label>
         <label class="wide">备注<input id="soldering-notes" value="{html.escape(str(active_job.get("notes") or ""))}"></label>
         <div class="wide soldering-actions">
           <button class="primary" type="button" id="start-soldering">开始/继续焊接</button>
           <button class="button" type="button" id="finish-soldering" {"disabled" if not active_job else ""}>结束并扣减库存</button>
         </div>
-        <div id="soldering-feedback" class="lcsc-preview">进行中的焊接任务会保存在后端；重新登录后会继续显示。</div>
+        <div id="soldering-feedback" class="lcsc-preview" data-soldering-status>进行中的焊接任务会保存在后端；重新登录后会继续显示。</div>
         <div id="soldering-consumption-summary">{completed_consumption_html}</div>
       </section>
-      <section class="panel pcb-visual-panel">
-        <div class="panel-head"><h2>PCB 可视化窗口</h2><span>{html.escape(selected_pcb.get("original_filename") or "未选择")}</span></div>
+      <section class="panel interactive-bom-panel pcb-visual-panel" data-interactive-bom-api="/api/boms/{urllib.parse.quote(str(bom_id))}/interactive-bom">
+        <div class="panel-head"><h2>PCB-BOM 联动视图</h2><span>{html.escape(selected_pcb.get("original_filename") or "使用 BOM 坐标")}</span></div>
         {selected_meta_html}
         <div class="pcb-visual-stage">
-          {iframe_html}
-          <div class="pcb-marker-layer">{''.join(marker_rows)}</div>
+          {preview_html}
+        </div>
+        <div class="interactive-bom-viewer" data-bom-id="{html.escape(bom_id, quote=True)}" data-selected-pcb-id="{html.escape(selected_pcb_id, quote=True)}">
+          <script type="application/json" data-interactive-bom-payload>{interactive_payload_json}</script>
         </div>
       </section>
       {analysis_history_panel}
-      <section class="panel bom-link-panel">
-        <div class="panel-head"><h2>BOM 器件联动</h2><span>{len(bom_rows)} 行</span></div>
-        <div class="table-wrap"><table class="bom-link-table"><thead><tr><th>#</th><th>位号</th><th>器件</th><th>封装</th><th>数量</th><th>LCSC/供应商</th></tr></thead><tbody>{''.join(bom_rows) or '<tr><td colspan="6">没有可联动的 BOM 行。</td></tr>'}</tbody></table></div>
-      </section>
     </section>
     <script src="/static/soldering_workbench.js"></script>
+    <script src="/static/interactive_bom.js"></script>
     """
     return render_layout("BOM 焊接工作台", body, user, "BOM对照")
 
@@ -9567,8 +9205,9 @@ def process_bom_upload(path, original_name, user, conn=None):
     lcsc_codes = extract_lcsc_codes(
         [item["name"] for item in items] + [alias for item in items for alias in item.get("aliases", [])]
     )
-    lcsc_result = enrich_lcsc_codes(lcsc_codes, force=False)
-    lcsc_cache = lcsc_result["cache"]
+    # Keep BOM upload responsive: do not fetch LCSC over the network here.
+    # Admins can refresh/populate the cache from the reports page when needed.
+    lcsc_cache = load_lcsc_cache()
     for item in items:
         item_codes = extract_lcsc_codes([item["name"]] + item.get("aliases", []))
         item["aliases"] = list(dict.fromkeys(item.get("aliases", []) + lcsc_aliases_for_codes(item_codes, lcsc_cache)))
@@ -9629,7 +9268,7 @@ def process_bom_upload(path, original_name, user, conn=None):
         purchase_rows,
         created_at_iso,
         lcsc_codes,
-        lcsc_result["fetched"],
+        [],
     )
     try:
         append_bom_record(bom_record)
@@ -9642,7 +9281,7 @@ def process_bom_upload(path, original_name, user, conn=None):
         "upload_id": upload_id,
         "bom_id": bom_record["bom_id"],
         "lcsc_codes": lcsc_codes,
-        "lcsc_fetched": lcsc_result["fetched"],
+        "lcsc_fetched": [],
     }
 
 
@@ -9826,6 +9465,7 @@ def render_layout(title, body, user=None, active="", scripts=None):
             ("/inventory", "仓库检索"),
             ("/inventory/new", "填写表单"),
             ("/bom", "BOM对照"),
+            ("/soldering/workbench", "焊接工作台"),
             ("/spares", "比赛备件"),
             ("/analytics", "统计排行"),
             ("/assistant", "智能助手"),
@@ -10348,7 +9988,7 @@ def active_soldering_resume_html(user):
                 <strong>{html.escape(str(title))}</strong>
                 <small>制板 {job.get('board_count', 0)} 片 · 开始 {html.escape(str(job.get('started_at') or ''))}</small>
               </div>
-              <a class="button" href="/bom">继续</a>
+              <a class="button" href="/soldering/workbench">继续</a>
             </article>
             """
         )
@@ -10429,8 +10069,9 @@ def bom_pcb_upload_form_html(record):
     escaped_bom_id = html.escape(bom_id)
     return f"""
       <form class="pcb-attach-form" method="post" action="/api/boms/{urllib.parse.quote(bom_id)}/pcb" data-bom-id="{escaped_bom_id}" enctype="multipart/form-data">
-        <input id="pcb-file-{escaped_bom_id}" type="file" name="pcb_file" accept=".zip,.gbr,.ger,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gm1,.drl,.pcb,.kicad_pcb,.html,.htm,.pdf,.json,.txt,.csv" multiple>
-        <label for="pcb-file-{escaped_bom_id}">上传 PCB/Gerber/HTML/PDF</label>
+        <input id="pcb-file-{escaped_bom_id}" type="file" name="pcb_file" accept=".zip,.gbr,.ger,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gm1,.drl,.pcb,.kicad_pcb,.brd,.fbrd,.html,.htm,.pdf,.json,.txt,.csv,.epro" multiple>
+        <small>支持 .epro；上传后会自动解包、识别 .epcb，并生成交互 BOM JSON 和 HTML。</small>
+        <label for="pcb-file-{escaped_bom_id}">上传 PCB/Gerber/HTML/PDF/.epro</label>
         <button class="button" type="submit">关联</button>
       </form>
     """
@@ -10612,6 +10253,8 @@ def soldering_workbench_html(user):
         }});
       }});
       root.querySelectorAll(".pcb-attach-form").forEach((form) => {{
+        if (form.dataset.pcbAttachBound === "1") return;
+        form.dataset.pcbAttachBound = "1";
         form.addEventListener("submit", async (event) => {{
           event.preventDefault();
           const bomId = form.dataset.bomId || "";
@@ -10640,6 +10283,8 @@ def soldering_workbench_html(user):
         }});
       }});
       root.querySelectorAll(".pcb-attach-form").forEach((form) => {{
+        if (form.dataset.pcbAttachBound === "1") return;
+        form.dataset.pcbAttachBound = "1";
         form.addEventListener("submit", async (event) => {{
           event.preventDefault();
           const bomId = form.dataset.bomId || "";
@@ -10668,6 +10313,8 @@ def soldering_workbench_html(user):
         }});
       }});
       root.querySelectorAll(".pcb-attach-form").forEach((form) => {{
+        if (form.dataset.pcbAttachBound === "1") return;
+        form.dataset.pcbAttachBound = "1";
         form.addEventListener("submit", async (event) => {{
           event.preventDefault();
           const bomId = form.dataset.bomId || "";
@@ -10894,14 +10541,119 @@ def clean_inventory_search_value(value, max_len=200):
 
 
 def inventory_like_value(value):
+    return "%" + inventory_like_escape(value) + "%"
+
+
+def inventory_like_escape(value):
     return (
-        "%"
-        + str(value or "")
+        str(value or "")
         .replace("\\", "\\\\")
         .replace("%", "\\%")
         .replace("_", "\\_")
-        + "%"
     )
+
+
+def inventory_prefix_like_value(value):
+    return inventory_like_escape(value) + "%"
+
+
+def inventory_device_location_variants(box, strip=None, cell=None):
+    try:
+        box_number = int(box)
+    except (TypeError, ValueError):
+        return []
+    if not 1 <= box_number <= 30:
+        return []
+    box_parts = [f"H{box_number}"]
+    if box_number < 10:
+        box_parts.append(f"H{box_number:02d}")
+    variants = []
+    if strip is None:
+        return list(dict.fromkeys(box_parts))
+    try:
+        strip_number = int(strip)
+    except (TypeError, ValueError):
+        return []
+    if not 1 <= strip_number <= 14:
+        return []
+    strip_parts = [str(strip_number), f"{strip_number:02d}"]
+    if cell is None:
+        for box_part in box_parts:
+            for strip_part in strip_parts:
+                variants.append(f"{box_part}-{strip_part}")
+        return list(dict.fromkeys(variants))
+    try:
+        cell_number = int(cell)
+    except (TypeError, ValueError):
+        return []
+    if not 1 <= cell_number <= 4:
+        return []
+    cell_parts = [str(cell_number), f"{cell_number:02d}"]
+    for box_part in box_parts:
+        for strip_part in strip_parts:
+            for cell_part in cell_parts:
+                variants.append(f"{box_part}-{strip_part}-{cell_part}")
+    return list(dict.fromkeys(variants))
+
+
+def normalize_inventory_device_location_token(token):
+    text = str(token or "").strip().upper()
+    text = re.sub(r"[＿_/\\\s]+", "-", text)
+    text = text.replace("－", "-").replace("—", "-").replace("–", "-")
+    text = re.sub(r"-+", "-", text).strip("-")
+    match = re.fullmatch(r"H0*(\d{1,2})(?:-0*(\d{1,2})(?:-0*(\d{1,2}))?)?", text)
+    if not match:
+        return None
+    box = parse_int(match.group(1), 0)
+    strip = parse_int(match.group(2), 0) if match.group(2) is not None else None
+    cell = parse_int(match.group(3), 0) if match.group(3) is not None else None
+    if not 1 <= box <= 30:
+        return None
+    if strip is not None and not 1 <= strip <= 14:
+        return None
+    if cell is not None and not 1 <= cell <= 4:
+        return None
+    canonical = f"H{box}"
+    level = "box"
+    description = f"H{box}（{box} 号器件盒）"
+    if strip is not None:
+        canonical = f"{canonical}-{strip:02d}"
+        level = "strip"
+        description = f"{canonical}（{box} 号盒第 {strip} 条）"
+    if cell is not None:
+        canonical = f"{canonical}-{cell:02d}"
+        level = "cell"
+        description = f"{canonical}（{box} 号盒第 {strip} 条第 {cell} 格）"
+    return {
+        "mode": "device",
+        "level": level,
+        "box": box,
+        "strip": strip,
+        "cell": cell,
+        "canonical": canonical,
+        "description": description,
+        "variants": inventory_device_location_variants(box, strip, cell),
+    }
+
+
+def inventory_location_search_clause(token):
+    device = normalize_inventory_device_location_token(token)
+    if not device:
+        return "", [], None
+    expression = "UPPER(TRIM(location))"
+    clauses = []
+    params = []
+    for variant in device["variants"]:
+        upper_variant = str(variant).upper()
+        if device["level"] == "cell":
+            clauses.append(f"{expression} = ?")
+            params.append(upper_variant)
+        else:
+            clauses.append(f"({expression} = ? OR {expression} LIKE ? ESCAPE '\\')")
+            params.extend([upper_variant, inventory_prefix_like_value(upper_variant + "-")])
+    if not clauses:
+        return "", [], None
+    return "(" + " OR ".join(clauses) + ")", params, device
 
 
 def inventory_search_token_is_specific(token):
@@ -10946,7 +10698,7 @@ def inventory_search_token_kind(token):
     lower = text.lower()
     if re.fullmatch(r"C\d{4,}", upper) and upper not in COMMON_PACKAGE_CODES:
         return "lcsc", "LCSC 编号"
-    if re.fullmatch(r"(?:H\d{1,2}(?:-\d{1,2}){0,2}|[A-Z0-9]+-L[1-5](?:-\d{1,2})?|L[1-5])", upper):
+    if normalize_inventory_device_location_token(text) or re.fullmatch(r"(?:[A-Z0-9]+-L[1-5](?:-\d{1,2})?|L[1-5])", upper):
         return "location", "仓位"
     if re.fullmatch(r"(?:[CR]?(?:0201|0402|0603|0805|1206|1210|1812|2010|2512)|SOT-?\d+|SOD-?\d+|SOIC-?\d+|TSSOP-?\d+|QFN-?\d*|QFP-?\d*|LQFP-?\d*|DIP-?\d+)", upper):
         return "package", "封装"
@@ -11060,6 +10812,19 @@ def inventory_smart_search_plan(query):
         kind, kind_label = inventory_search_token_kind(token)
         fields = ["name", "category", "location", "note"]
         if kind == "location":
+            clause, clause_params, location_info = inventory_location_search_clause(token)
+            if clause:
+                filters.append(clause)
+                params.extend(clause_params)
+                token_plans.append(
+                    {
+                        "token": location_info["canonical"],
+                        "kind": kind,
+                        "label": kind_label,
+                        "description": location_info["description"],
+                    }
+                )
+                continue
             fields = ["location"]
         elif kind == "lcsc":
             fields = ["name", "note"]
@@ -11080,7 +10845,8 @@ def inventory_smart_search_plan(query):
         params.append(date_to)
         labels.append({"label": "结束日期", "value": date_to})
     for item in token_plans:
-        labels.append({"label": item["label"], "value": item["token"]})
+        labels.append({"label": item["label"], "value": item.get("description") or item["token"]})
+    location_search = any(item.get("kind") == "location" for item in token_plans)
 
     return {
         "q": visible_q,
@@ -11095,6 +10861,8 @@ def inventory_smart_search_plan(query):
         "has_search": bool(filters) and bool(token_plans),
         "blocked_broad_search": bool(visible_q or filters) and not bool(token_plans),
         "limit": INVENTORY_SEARCH_RESULT_LIMIT,
+        "location_search": location_search,
+        "order_by": "location" if location_search else "recent",
     }
 
 
@@ -11190,8 +10958,16 @@ def cleanup_sessions(now=None):
             SESSIONS.pop(token, None)
 
 
+def safe_cookie(header):
+    try:
+        return SimpleCookie(header or "")
+    except Exception as exc:
+        print(f"[cookie] ignored invalid Cookie header: {exc}")
+        return SimpleCookie()
+
+
 def session_user_id(handler):
-    cookie = SimpleCookie(handler.headers.get("Cookie", ""))
+    cookie = safe_cookie(handler.headers.get("Cookie", ""))
     token = cookie.get("session")
     if not token:
         return None
@@ -11271,7 +11047,12 @@ def inventory_page(user, query):
     warehouse_labels = {"main": "原仓库", "competition": "比赛备件仓库", "both": "两个仓库"}
     has_search = search_plan["has_search"]
     rows = (
-        inventory_rows(" AND ".join(search_plan["filters"]), search_plan["params"], limit=search_plan["limit"])
+        inventory_rows(
+            " AND ".join(search_plan["filters"]),
+            search_plan["params"],
+            limit=search_plan["limit"],
+            order_by=search_plan.get("order_by", "recent"),
+        )
         if has_search and warehouse in ("main", "both")
         else []
     )
@@ -11317,7 +11098,7 @@ def inventory_page(user, query):
         result_section = """
     <section class="panel inventory-results-panel">
       <div class="panel-head"><h2>搜索结果</h2><span>等待具体关键词</span></div>
-      <div class="empty search-empty">示例：100nF 0603、C25803、H1-07、继电器、A1-L1-01。</div>
+      <div class="empty search-empty">示例：100nF 0603、C25803、H1、H1-07、H1-07-04、继电器、A1-L1-01。</div>
     </section>
         """
     else:
@@ -11330,7 +11111,7 @@ def inventory_page(user, query):
         result_section = """
     <section class="panel inventory-results-panel">
       <div class="panel-head"><h2>搜索结果</h2><span>等待检索</span></div>
-      <div class="empty search-empty">请输入一个总检索词，例如“100nF 0603”“C25803”“H1-07”“继电器”“A1-L1-01”。系统会自动识别关键词并定位对应器件。</div>
+      <div class="empty search-empty">请输入一个总检索词，例如“100nF 0603”“C25803”“H1”“H1-07”“H1-07-04”“继电器”“A1-L1-01”。系统会自动识别关键词并定位对应器件。</div>
     </section>
         """
     body = f"""
@@ -11347,7 +11128,7 @@ def inventory_page(user, query):
         </label>
         <label class="smart-search-field">
           <span>总检索窗口</span>
-          <input name="q" value="{html.escape(q)}" autocomplete="off" placeholder="输入器件名、规格、封装、仓位、责任人、组别或 LCSC 编号，例如：100nF 0603 H1">
+          <input name="q" value="{html.escape(q)}" autocomplete="off" placeholder="输入器件名、规格、封装、仓位、责任人、组别或 LCSC 编号，例如：100nF 0603 H1-07">
         </label>
         <button class="primary smart-search-submit" type="submit">智能检索</button>
       </form>
@@ -11539,6 +11320,7 @@ def soldering_workbench_html(user):
     for job in active_jobs:
         record = find_bom_record(job.get("bom_id")) or {}
         title = soldering_bom_title(record, job)
+        detail_url = soldering_workbench_url(job.get("bom_id") or "", job.get("pcb_file_id") or "")
         active_cards.append(
             f"""
             <article class="soldering-job-card">
@@ -11547,22 +11329,22 @@ def soldering_workbench_html(user):
                 <strong>{html.escape(str(title))}</strong>
                 <small>制板 {job.get('board_count', 0)} 片 · 开始 {html.escape(str(job.get('started_at') or ''))}</small>
               </div>
-              <button class="button soldering-finish" type="button" data-job-id="{html.escape(str(job.get('job_id') or ''))}">结束焊接</button>
+              <div class="soldering-card-actions">
+                <a class="button" href="{html.escape(detail_url, quote=True)}">查看 BOM 明细</a>
+                <button class="button soldering-finish" type="button" data-job-id="{html.escape(str(job.get('job_id') or ''))}">结束并扣减库存</button>
+              </div>
             </article>
             """
         )
     record_cards = []
-    for record in records[:12]:
+    for record in records[:24]:
         bom_id = str(record.get("bom_id") or "")
         if not bom_id:
             continue
         title = soldering_bom_title(record)
         active = find_active_soldering_job_for_bom(record)
         summary = record.get("summary") if isinstance(record.get("summary"), dict) else {}
-        pcb_files = record.get("pcb_files") if isinstance(record.get("pcb_files"), list) else []
-        latest_pcb = record.get("latest_pcb_file") if isinstance(record.get("latest_pcb_file"), dict) else (pcb_files[-1] if pcb_files else {})
-        latest_pcb_id = str(latest_pcb.get("pcb_id") or latest_pcb.get("pcb_file_id") or latest_pcb.get("id") or "")
-        workbench_link = f'<a class="button" href="{html.escape(soldering_workbench_url(bom_id, latest_pcb_id))}">BOM/PCB 联动</a>'
+        detail_url = soldering_workbench_url(bom_id)
         completed_consumption_html = ""
         if not active:
             completed_job_id = record.get("last_completed_soldering_job_id") or record.get("latest_soldering_job_id")
@@ -11575,48 +11357,60 @@ def soldering_workbench_html(user):
                 <strong>正在焊接</strong>
                 <span>制板 {active.get('board_count', 0)} 片 · 开始 {html.escape(str(active.get('started_at') or ''))}</span>
               </div>
-              <button class="button soldering-finish" type="button" data-job-id="{html.escape(str(active.get('job_id') or ''))}">结束焊接</button>
-            """ + bom_pcb_files_html(record) + bom_pcb_upload_form_html(record) + workbench_link
+              <div class="soldering-card-actions">
+                <a class="button" href="{html.escape(detail_url, quote=True)}">查看 BOM 明细</a>
+                <button class="button soldering-finish" type="button" data-job-id="{html.escape(str(active.get('job_id') or ''))}">结束并扣减库存</button>
+              </div>
+            """
         else:
             action = f"""
               <form class="soldering-start-form" data-bom-id="{html.escape(bom_id)}">
                 <label>本次制板数量<input type="number" name="board_count" min="1" step="1" required placeholder="例如 3"></label>
-                {soldering_pcb_select_html(record)}
                 <label>备注<input name="notes" maxlength="200" placeholder="可选"></label>
-                <button class="primary" type="submit">开始焊接</button>
+                <div class="soldering-card-actions">
+                  <button class="primary" type="submit">选择此 BOM 开始焊接</button>
+                  <a class="button" href="{html.escape(detail_url, quote=True)}">查看 BOM 明细</a>
+                </div>
               </form>
-            """ + bom_pcb_files_html(record) + bom_pcb_upload_form_html(record) + workbench_link
+            """
         record_cards.append(
             f"""
             <article class="soldering-bom-card">
               <div class="soldering-card-head">
-                <span>{html.escape(str(record.get('status') or 'awaiting_pcb'))}</span>
+                <span>{html.escape(str(record.get('status') or 'awaiting_start'))}</span>
                 <strong>{html.escape(str(title))}</strong>
                 <small>{html.escape(str(record.get('created_at') or ''))}</small>
               </div>
               <div class="soldering-card-meta">
                 <span>器件 {summary.get('aggregated_item_count', 0)}</span>
                 <span>总用量 {summary.get('total_quantity', 0)}</span>
-                <span>Files {len(pcb_files)}</span>
+                <span>BOM ID {html.escape(bom_id[-10:] if len(bom_id) > 10 else bom_id)}</span>
               </div>
               {completed_consumption_html}
               {action}
             </article>
             """
         )
-    empty_records = '<div class="empty">暂无可开始焊接的 BOM。先上传 BOM，必要时关联 PCB 文件。</div>'
+    empty_records = '<div class="empty">暂无可开始焊接的 BOM。请先在 BOM 对照页上传 BOM。</div>'
     return f"""
+    <header class="page-head">
+      <div><p class="eyebrow">Soldering</p><h1>焊接工作台</h1></div>
+      <a class="button" href="/bom">上传 BOM</a>
+    </header>
     <section class="panel soldering-workbench" data-soldering-workbench>
-      <div class="panel-head"><h2>焊接工作台</h2><span>开始时记录制板数量和时间，只有结束按钮会完成流程</span></div>
+      <div class="panel-head"><h2>未结束的焊接工作</h2><span>{len(active_jobs)} 个进行中</span></div>
       <div class="soldering-active-grid">{''.join(active_cards) or '<div class="empty">当前没有进行中的焊接工作。</div>'}</div>
+    </section>
+    <section class="panel soldering-workbench" data-soldering-workbench>
+      <div class="panel-head"><h2>选择本次使用的 BOM</h2><span>结束焊接时按 BOM 用量和制板数量扣减库存</span></div>
       <div class="soldering-bom-grid">{''.join(record_cards) or empty_records}</div>
       <div class="lcsc-preview" data-soldering-status>等待操作。</div>
     </section>
     <script>
     (function () {{
-      const root = document.querySelector("[data-soldering-workbench]");
-      if (!root) return;
-      const status = root.querySelector("[data-soldering-status]");
+      const roots = Array.from(document.querySelectorAll("[data-soldering-workbench]"));
+      if (!roots.length) return;
+      const status = document.querySelector("[data-soldering-status]");
       function setStatus(text, isError) {{
         if (!status) return;
         status.textContent = text;
@@ -11632,7 +11426,7 @@ def soldering_workbench_html(user):
         if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
         return data;
       }}
-      root.querySelectorAll(".soldering-start-form").forEach((form) => {{
+      document.querySelectorAll(".soldering-start-form").forEach((form) => {{
         form.addEventListener("submit", async (event) => {{
           event.preventDefault();
           const payload = Object.fromEntries(new FormData(form).entries());
@@ -11651,15 +11445,17 @@ def soldering_workbench_html(user):
           }}
         }});
       }});
-      root.querySelectorAll(".soldering-finish").forEach((button) => {{
+      document.querySelectorAll(".soldering-finish").forEach((button) => {{
         button.addEventListener("click", async () => {{
           const jobId = button.dataset.jobId || "";
           if (!jobId) return;
-          if (!window.confirm("结束这单焊接吗？")) return;
-          setStatus("正在结束焊接...");
+          if (!window.confirm("结束这单焊接并按 BOM 用量扣减库存吗？")) return;
+          setStatus("正在结束焊接并扣减库存...");
           try {{
-            await postJson("/api/soldering/jobs/" + encodeURIComponent(jobId) + "/finish", {{}});
-            window.location.reload();
+            const data = await postJson("/api/soldering/jobs/" + encodeURIComponent(jobId) + "/finish", {{}});
+            const totals = data && data.consumption && data.consumption.summary ? data.consumption.summary : {{}};
+            setStatus("焊接已结束。需用：" + (totals.required_quantity || 0) + "；已耗：" + (totals.consumed_quantity || 0) + "；缺口：" + (totals.shortage_quantity || 0) + "。");
+            window.setTimeout(() => window.location.reload(), 900);
           }} catch (err) {{
             setStatus(err.message, true);
           }}
@@ -11668,7 +11464,6 @@ def soldering_workbench_html(user):
     }})();
     </script>
     """
-
 
 def analysis_detail_meta_item(label, value_html):
     return f"<div><dt>{html.escape(str(label))}</dt><dd>{value_html or '-'}</dd></div>"
@@ -11727,6 +11522,20 @@ STATUS_LABELS_ZH = {
     "negative": "负向变动",
     "all": "全部",
 }
+
+
+STATUS_LABELS_ZH.update(
+    {
+        "converted": "已转换",
+        "pending_external_converter": "等待外部转换器",
+        "external_converter_config_error": "外部转换配置错误",
+        "external_converter_failed": "外部转换失败",
+        "external_converter_timeout": "外部转换超时",
+        "external_converter_no_output": "外部转换无输出",
+        "no_pcb_artifact": "未发现 PCB 产物",
+        "unsupported": "不支持",
+    }
+)
 
 
 def zh_status(value):
@@ -12951,7 +12760,6 @@ def bom_page(user, message="", error="", result=None):
           <div class="table-wrap"><table><thead><tr><th>类别</th><th>名称</th><th>BOM需求</th><th>库存</th><th>缺口数量</th><th>原因</th></tr></thead><tbody>{purchase_table or '<tr><td colspan="6">库存满足本次 BOM。</td></tr>'}</tbody></table></div>
         </section>
         """
-    attachment_html = bom_attachment_panel_html(user)
     body = f"""
     <header class="page-head"><div><p class="eyebrow">BOM Compare</p><h1>BOM 文件对照</h1></div></header>
     <section class="form-panel">
@@ -12966,7 +12774,6 @@ def bom_page(user, message="", error="", result=None):
       </form>
     </section>
     {result_html}
-    {attachment_html}
     <section class="panel">
       <div class="panel-head"><h2>最近 BOM</h2><span>{len(uploads)} 条</span></div>
       <div class="table-wrap"><table><thead><tr><th>时间</th><th>文件</th><th>用户</th><th>器件数</th><th>总用量</th></tr></thead><tbody>{upload_rows or '<tr><td colspan="5">暂无 BOM 上传记录。</td></tr>'}</tbody></table></div>
@@ -14041,7 +13848,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return "; ".join(parts)
 
     def csrf_token(self):
-        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie = safe_cookie(self.headers.get("Cookie", ""))
         token = cookie.get(CSRF_COOKIE_NAME)
         value = token.value if token else ""
         if re.fullmatch(r"[A-Za-z0-9_\-]{32,128}", value or ""):
@@ -14134,7 +13941,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return ""
 
     def verify_csrf_post(self):
-        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie = safe_cookie(self.headers.get("Cookie", ""))
         cookie_token = cookie.get(CSRF_COOKIE_NAME)
         request_token = self.csrf_token_from_request()
         return bool(cookie_token and request_token and hmac.compare_digest(cookie_token.value, request_token))
@@ -14220,6 +14027,34 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def handle_uncaught_exception(self, exc):
+        trace = traceback.format_exc()
+        log_written = False
+        try:
+            SERVER_ERRORS_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with SERVER_ERRORS_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    "\n"
+                    + "=" * 80
+                    + f"\n{now_text()} {self.command} {self.path}\n"
+                    + f"Client: {self.client_address[0] if self.client_address else ''}\n"
+                    + f"User-Agent: {self.headers.get('User-Agent', '')}\n"
+                    + trace
+                )
+            log_written = True
+        except Exception:
+            pass
+        print(f"[request error] {self.command} {self.path}: {exc}")
+        if self.path.startswith("/api/"):
+            return self.send_json({"error": "服务器内部错误。"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        message = "服务器内部错误，详情已写入 logs/server_errors.log。"
+        if not log_written:
+            message = "服务器内部错误，异常日志写入失败，请查看服务端控制台输出。"
+        return self.send_text(
+            message,
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
     def send_html(self, content, status=HTTPStatus.OK, headers=None):
         csrf_token = self.csrf_token()
         content = self.inject_csrf_html(content, csrf_token)
@@ -14261,6 +14096,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_security_headers()
         self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
         self.end_headers()
         self.log_access_db(HTTPStatus.SEE_OTHER)
 
@@ -14348,6 +14184,12 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return self.parse_multipart_body(self.read_cached_body())
 
     def do_GET(self):
+        try:
+            return self._do_GET()
+        except Exception as exc:
+            return self.handle_uncaught_exception(exc)
+
+    def _do_GET(self):
         if self.reject_untrusted_host():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -14370,10 +14212,14 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if path == "/download":
             return self.download(query)
         user = current_user(self)
+        if not user and path.startswith("/pcb/"):
+            preview_token = (query.get("preview_token", [""])[0] or "").strip()
+            if preview_token:
+                return self.serve_pcb_file(None, path, preview_token=preview_token)
         if not user:
             if path.startswith("/api/"):
                 return self.send_json({"error": "Login required."}, HTTPStatus.UNAUTHORIZED)
-            return self.redirect("/login")
+            return self.send_html(render_auth("login", "Session expired. Please sign in again."), headers=self.auth_cache_headers())
         if path == "/dashboard":
             return self.send_html(dashboard_page(user))
         if path == "/api/categories":
@@ -14436,7 +14282,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         ):
             return self.send_json({"error": "Feature removed."}, HTTPStatus.NOT_FOUND)
         if path.startswith("/pcb/"):
-            return self.serve_pcb_file(user, path)
+            return self.serve_pcb_file(user, path, preview_token=(query.get("preview_token", [""])[0] or "").strip())
         analysis_target = parse_bom_pcb_analysis_path(path)
         if analysis_target:
             bom_id, pcb_file_id = analysis_target
@@ -14444,6 +14290,9 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/boms/") and path.endswith("/soldering"):
             bom_id = urllib.parse.unquote(path[len("/api/boms/") : -len("/soldering")]).strip()
             return self.api_bom_soldering_jobs(user, bom_id)
+        if path.startswith("/api/boms/") and path.endswith("/interactive-bom"):
+            bom_id = urllib.parse.unquote(path[len("/api/boms/") : -len("/interactive-bom")]).strip()
+            return self.api_bom_interactive_bom(user, bom_id)
         if path.startswith("/api/boms/"):
             bom_id = urllib.parse.unquote(path.removeprefix("/api/boms/")).strip()
             return self.api_bom_detail(user, bom_id)
@@ -14503,6 +14352,12 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return self.send_html(render_layout("未找到", '<section class="panel">页面不存在。</section>', user), HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        try:
+            return self._do_POST()
+        except Exception as exc:
+            return self.handle_uncaught_exception(exc)
+
+    def _do_POST(self):
         if self.reject_untrusted_host():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -14739,7 +14594,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def serve_pcb_file(self, user, path):
+    def serve_pcb_file(self, user, path, preview_token=""):
         parts = path.strip("/").split("/")
         if len(parts) != 3:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -14748,7 +14603,8 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         bom_id = urllib.parse.unquote(parts[1]).strip()
         pcb_file_id = urllib.parse.unquote(parts[2]).strip()
         record = find_bom_record(bom_id)
-        if not record or not user_can_view_bom(record, user):
+        token_allowed = bool(preview_token and verify_pcb_preview_token(preview_token, bom_id, pcb_file_id, user=user))
+        if not record or not (user_can_view_bom(record, user) or token_allowed):
             self.send_error(HTTPStatus.FORBIDDEN if record else HTTPStatus.NOT_FOUND)
             self.log_access_db(HTTPStatus.FORBIDDEN if record else HTTPStatus.NOT_FOUND)
             return
@@ -14766,18 +14622,36 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         data = read_data_bytes(target)
         extension = Path(str(metadata.get("stored_filename") or metadata.get("original_filename") or target.name)).suffix.lower()
         content_type = metadata.get("mime_type") or mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        trusted_generated_html = pcb_file_is_internal_ibom_html(metadata, extension)
         if extension in (".html", ".htm"):
-            content_type = "text/plain; charset=utf-8"
+            content_type = "text/html; charset=utf-8" if trusted_generated_html else "text/plain; charset=utf-8"
+        csp = (
+            "default-src 'none'; "
+            "script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; "
+            "img-src data:; "
+            "base-uri 'none'; "
+            "form-action 'none'; "
+            "frame-ancestors 'self'; "
+            "sandbox allow-scripts"
+            if trusted_generated_html
+            else "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox"
+        )
         self.send_response(HTTPStatus.OK)
-        self.send_security_headers()
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("Content-Type", content_type)
         self.send_header(
             "Content-Disposition",
             "inline; " + content_disposition_filename(metadata.get("original_filename") or target.name),
         )
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", csp)
+        self._security_headers_sent = True
         self.end_headers()
         self.wfile.write(data)
         self.log_access_db(HTTPStatus.OK)
@@ -14785,6 +14659,8 @@ class WarehouseHandler(BaseHTTPRequestHandler):
     def soldering_workbench(self, user, query):
         bom_id = (query.get("bom_id", [""])[0] or "").strip()
         pcb_file_id = (query.get("pcb_file_id", [""])[0] or "").strip()
+        if not bom_id:
+            return self.send_html(render_layout("焊接工作台", soldering_workbench_html(user), user, "焊接工作台"))
         record = find_bom_record(bom_id)
         if not record:
             return self.send_html(render_layout("BOM not found", '<section class="panel">BOM record not found.</section>', user), HTTPStatus.NOT_FOUND)
@@ -14832,6 +14708,16 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if not user_can_view_bom(record, user):
             return self.send_json({"error": "Forbidden."}, HTTPStatus.FORBIDDEN)
         return self.send_json({"record": decorate_bom_record(record)})
+
+    def api_bom_interactive_bom(self, user, bom_id):
+        if not bom_id:
+            return self.send_json({"error": "BOM record not found."}, HTTPStatus.NOT_FOUND)
+        record = find_bom_record(bom_id)
+        if not record:
+            return self.send_json({"error": "BOM record not found."}, HTTPStatus.NOT_FOUND)
+        if not user_can_view_bom(record, user):
+            return self.send_json({"error": "Forbidden."}, HTTPStatus.FORBIDDEN)
+        return self.send_json(interactive_bom_payload_for_record(record))
 
     def api_attach_pcb(self, user, bom_id):
         if not bom_id:
@@ -15480,6 +15366,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/dashboard")
         self.send_header("Set-Cookie", self.session_cookie_value(token, max_age=SESSION_TTL_SECONDS))
         self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Content-Length", "0")
         self.end_headers()
         self.log_access_db(HTTPStatus.SEE_OTHER)
 
@@ -15530,7 +15417,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         return self.send_html(render_auth("login", message="注册成功，请登录。"), headers=self.auth_cache_headers())
 
     def logout(self):
-        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie = safe_cookie(self.headers.get("Cookie", ""))
         token = cookie.get("session")
         if token:
             with SESSIONS_LOCK:
@@ -15540,6 +15427,7 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie", self.session_cookie_value("", max_age=0))
         self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Content-Length", "0")
         self.end_headers()
         self.log_access_db(HTTPStatus.SEE_OTHER)
 

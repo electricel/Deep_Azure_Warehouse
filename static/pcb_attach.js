@@ -11,6 +11,8 @@
   }
 
   forms.forEach((form) => {
+    if (form.dataset.pcbAttachBound === "1") return;
+    form.dataset.pcbAttachBound = "1";
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const fileInput = form.querySelector('input[type="file"]');

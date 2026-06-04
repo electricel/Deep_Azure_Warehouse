@@ -6221,6 +6221,29 @@ body.pcb-keyframe-lab-page::before {
   color: #14171f;
 }
 
+.soldering-pcb-upload {
+  display: grid;
+  gap: 8px;
+  margin: -2px 0 14px;
+  padding: 10px;
+  border: 1px solid var(--workbench-border, rgba(20, 23, 31, 0.12));
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.soldering-pcb-upload > strong {
+  color: #2f3a48;
+  font-size: 13px;
+}
+
+.soldering-pcb-upload .pcb-attach-form {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.soldering-pcb-upload .pcb-attach-form button {
+  width: 100%;
+}
+
 .soldering-actions {
   display: flex;
   gap: 10px;
@@ -6430,18 +6453,29 @@ body.pcb-keyframe-lab-page::before {
 
 .pcb-visual-stage {
   position: relative;
-  min-height: 460px;
+  min-height: 0;
   overflow: hidden;
   border: 1px solid var(--workbench-border, rgba(20, 23, 31, 0.12));
   border-radius: 8px;
-  background: #0f1720;
+  background: #f8fafc;
 }
 
-.pcb-file-frame {
-  width: 100%;
-  height: 460px;
-  border: 0;
-  background: #fff;
+.pcb-preview-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  color: #1f2937;
+}
+
+.pcb-preview-actions div {
+  display: grid;
+  gap: 3px;
+}
+
+.pcb-preview-actions small {
+  color: #64748b;
 }
 
 .pcb-marker-layer {
@@ -8322,5 +8356,234 @@ body.pcb-keyframe-lab-page::before {
 @media (prefers-reduced-motion: reduce) {
   .public-aura-video video {
     display: none;
+  }
+}
+
+.interactive-bom-viewer {
+  --interactive-bom-ink: #16202e;
+  --interactive-bom-muted: #667085;
+  --interactive-bom-line: rgba(22, 32, 46, 0.14);
+  --interactive-bom-panel: rgba(255, 255, 255, 0.82);
+  --interactive-bom-board: #1c2633;
+  --interactive-bom-copper: #d5a247;
+  --interactive-bom-active: #0a84ff;
+  width: 100%;
+  color: var(--interactive-bom-ink);
+}
+
+.interactive-bom-viewer .interactive-bom-shell {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.05fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.interactive-bom-viewer .interactive-bom-toolbar {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.interactive-bom-viewer .interactive-bom-search {
+  display: block;
+  width: min(480px, 100%);
+}
+
+.interactive-bom-viewer .interactive-bom-search input {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--interactive-bom-line);
+  border-radius: 8px;
+  padding: 0 12px;
+  color: var(--interactive-bom-ink);
+  background: rgba(255, 255, 255, 0.9);
+  outline: none;
+}
+
+.interactive-bom-viewer .interactive-bom-search input:focus {
+  border-color: rgba(10, 132, 255, 0.58);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.12);
+}
+
+.interactive-bom-viewer .interactive-bom-count {
+  color: var(--interactive-bom-muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.interactive-bom-viewer .interactive-bom-board-pane,
+.interactive-bom-viewer .interactive-bom-table-pane {
+  min-width: 0;
+  border: 1px solid var(--interactive-bom-line);
+  border-radius: 8px;
+  background: var(--interactive-bom-panel);
+  box-shadow: 0 16px 42px rgba(22, 32, 46, 0.08);
+  overflow: hidden;
+}
+
+.interactive-bom-viewer .interactive-bom-board-pane {
+  padding: 14px;
+}
+
+.interactive-bom-viewer .interactive-bom-board {
+  position: relative;
+  width: 100%;
+  min-height: 420px;
+  aspect-ratio: 1.45 / 1;
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    radial-gradient(circle at 18% 20%, rgba(213, 162, 71, 0.18), transparent 28%),
+    linear-gradient(145deg, #223245, var(--interactive-bom-board));
+  background-size: 28px 28px, 28px 28px, auto, auto;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), inset 0 22px 70px rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+}
+
+.interactive-bom-viewer .interactive-bom-board::before,
+.interactive-bom-viewer .interactive-bom-board::after {
+  content: "";
+  position: absolute;
+  inset: 18px;
+  border: 1px solid rgba(213, 162, 71, 0.28);
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.interactive-bom-viewer .interactive-bom-board::after {
+  inset: 36px;
+  border-style: dashed;
+  opacity: 0.48;
+}
+
+.interactive-bom-viewer .interactive-bom-board-layer {
+  position: absolute;
+  inset: 24px;
+}
+
+.interactive-bom-viewer .interactive-bom-marker {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  min-height: 16px;
+  border: 1px solid rgba(213, 162, 71, 0.9);
+  border-radius: 4px;
+  padding: 0 4px;
+  color: #fff8e7;
+  background: rgba(213, 162, 71, 0.48);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: translateZ(0);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.interactive-bom-viewer .interactive-bom-marker:hover,
+.interactive-bom-viewer .interactive-bom-marker.is-active {
+  z-index: 3;
+  border-color: #ffffff;
+  background: var(--interactive-bom-active);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.24), 0 12px 28px rgba(0, 0, 0, 0.28);
+  transform: scale(1.06);
+}
+
+.interactive-bom-viewer .interactive-bom-marker[data-side="bottom"] {
+  border-color: rgba(24, 164, 125, 0.9);
+  background: rgba(24, 164, 125, 0.48);
+}
+
+.interactive-bom-viewer .interactive-bom-marker[data-side="bottom"].is-active,
+.interactive-bom-viewer .interactive-bom-marker[data-side="bottom"]:hover {
+  border-color: #ffffff;
+  background: #18a47d;
+}
+
+.interactive-bom-viewer .interactive-bom-marker[hidden],
+.interactive-bom-viewer .interactive-bom-row[hidden] {
+  display: none;
+}
+
+.interactive-bom-viewer .interactive-bom-table-pane {
+  max-height: 560px;
+  overflow: auto;
+}
+
+.interactive-bom-viewer .interactive-bom-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.interactive-bom-viewer .interactive-bom-table th,
+.interactive-bom-viewer .interactive-bom-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--interactive-bom-line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.interactive-bom-viewer .interactive-bom-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: #344054;
+  background: rgba(247, 249, 252, 0.96);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.interactive-bom-viewer .interactive-bom-row {
+  cursor: pointer;
+  outline: none;
+}
+
+.interactive-bom-viewer .interactive-bom-row:hover,
+.interactive-bom-viewer .interactive-bom-row.is-active {
+  background: rgba(10, 132, 255, 0.1);
+}
+
+.interactive-bom-viewer .interactive-bom-row:focus-visible {
+  box-shadow: inset 3px 0 0 var(--interactive-bom-active);
+}
+
+.interactive-bom-viewer .interactive-bom-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 14px;
+}
+
+@media (max-width: 900px) {
+  .interactive-bom-viewer .interactive-bom-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .interactive-bom-viewer .interactive-bom-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .interactive-bom-viewer .interactive-bom-count {
+    white-space: normal;
+  }
+
+  .interactive-bom-viewer .interactive-bom-board {
+    min-height: 320px;
+  }
+
+  .interactive-bom-viewer .interactive-bom-table-pane {
+    max-height: 460px;
   }
 }
