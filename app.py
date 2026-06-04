@@ -10888,6 +10888,233 @@ def inventory_smart_search_meta_html(plan):
     """
 
 
+INVENTORY_AUDIT_ISSUE_LABELS = {
+    "missing_location": "仓位为空",
+    "placeholder_location": "仓位占位",
+    "invalid_location_format": "仓位格式异常",
+    "coarse_device_location": "器件盒仓位不够具体",
+    "legacy_location": "旧仓位格式",
+    "duplicate_inventory_record": "同物料同仓位重复",
+    "shared_location": "同仓位多物料",
+    "non_positive_quantity": "数量异常",
+    "missing_category": "类别为空",
+    "missing_name": "名称为空",
+}
+
+INVENTORY_AUDIT_SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+
+
+def normalized_inventory_location_text(value):
+    text = str(value or "").strip().upper()
+    text = re.sub(r"[\s＿_/\\]+", "-", text)
+    text = text.replace("－", "-").replace("—", "-").replace("–", "-")
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text
+
+
+def inventory_location_quality(location):
+    raw = str(location or "").strip()
+    normalized = normalized_inventory_location_text(raw)
+    issues = []
+    if not raw:
+        issues.append(
+            {
+                "code": "missing_location",
+                "severity": "error",
+                "label": INVENTORY_AUDIT_ISSUE_LABELS["missing_location"],
+                "detail": "位置字段为空，无法盘点。",
+            }
+        )
+        return {"key": "", "normalized": "", "kind": "missing", "level": "", "issues": issues}
+    if normalized in {"UNKNOWN", "N/A", "NA", "NONE", "NULL", "TBD", "待定", "未知", "未分配", "无"}:
+        issues.append(
+            {
+                "code": "placeholder_location",
+                "severity": "error",
+                "label": INVENTORY_AUDIT_ISSUE_LABELS["placeholder_location"],
+                "detail": "仓位像占位值，需要改成实际位置。",
+            }
+        )
+        return {"key": normalized, "normalized": normalized, "kind": "placeholder", "level": "", "issues": issues}
+
+    device = normalize_inventory_device_location_token(normalized)
+    if device:
+        if device["level"] != "cell":
+            issues.append(
+                {
+                    "code": "coarse_device_location",
+                    "severity": "warning",
+                    "label": INVENTORY_AUDIT_ISSUE_LABELS["coarse_device_location"],
+                    "detail": "H 器件盒仓位建议精确到单格，例如 H1-07-04。",
+                }
+            )
+        return {
+            "key": device["canonical"],
+            "normalized": device["canonical"],
+            "kind": "device",
+            "level": device["level"],
+            "issues": issues,
+        }
+
+    legacy_full = re.fullmatch(r"[A-Z]\d{1,3}-L[1-5]-\d{1,3}", normalized)
+    legacy_partial = re.fullmatch(r"[A-Z]\d{1,3}-L[1-5]", normalized)
+    if legacy_full:
+        issues.append(
+            {
+                "code": "legacy_location",
+                "severity": "info",
+                "label": INVENTORY_AUDIT_ISSUE_LABELS["legacy_location"],
+                "detail": "这是旧仓位格式；如果已迁入器件盒，建议改成 H盒-条-格。",
+            }
+        )
+        return {"key": normalized, "normalized": normalized, "kind": "legacy", "level": "cell", "issues": issues}
+    if legacy_partial:
+        issues.append(
+            {
+                "code": "coarse_device_location",
+                "severity": "warning",
+                "label": INVENTORY_AUDIT_ISSUE_LABELS["coarse_device_location"],
+                "detail": "旧仓位只到层级，建议补到具体格位或迁移到 H盒-条-格。",
+            }
+        )
+        return {"key": normalized, "normalized": normalized, "kind": "legacy", "level": "partial", "issues": issues}
+
+    issues.append(
+        {
+            "code": "invalid_location_format",
+            "severity": "error",
+            "label": INVENTORY_AUDIT_ISSUE_LABELS["invalid_location_format"],
+            "detail": "未识别为 H盒-条-格或旧 A1-L1-01 仓位格式。",
+        }
+    )
+    return {"key": normalized, "normalized": normalized, "kind": "unknown", "level": "", "issues": issues}
+
+
+def inventory_audit_issue(code, severity, detail):
+    return {
+        "code": code,
+        "severity": severity,
+        "label": INVENTORY_AUDIT_ISSUE_LABELS.get(code, code),
+        "detail": detail,
+    }
+
+
+def inventory_audit_entry_key(row):
+    category = normalize_key(row_value(row, "category", ""))
+    name = normalize_key(row_value(row, "name", ""))
+    location_quality = inventory_location_quality(row_value(row, "location", ""))
+    return "|".join([category, name, location_quality["key"]])
+
+
+def inventory_audit_rows_from_entries(rows, limit=200):
+    entries = []
+    by_item_location = {}
+    by_location = {}
+    for row in rows or []:
+        inventory_id = parse_int(row_value(row, "id"), 0)
+        category = str(row_value(row, "category", "") or "").strip()
+        name = str(row_value(row, "name", "") or "").strip()
+        location = str(row_value(row, "location", "") or "").strip()
+        quantity = parse_int(row_value(row, "quantity"), 0)
+        quality = inventory_location_quality(location)
+        issues = list(quality["issues"])
+        if quantity <= 0:
+            issues.append(inventory_audit_issue("non_positive_quantity", "error", "库存数量小于等于 0，建议修正数量或删除记录。"))
+        if not category:
+            issues.append(inventory_audit_issue("missing_category", "warning", "商品类别为空，会降低 BOM 匹配准确性。"))
+        if not name:
+            issues.append(inventory_audit_issue("missing_name", "error", "商品名称为空，无法可靠检索和匹配。"))
+
+        item_key = "|".join([normalize_key(category), normalize_key(name), quality["key"]])
+        location_key = quality["key"] or normalized_inventory_location_text(location)
+        item_identity = "|".join([normalize_key(category), normalize_key(name)])
+        entry = {
+            "id": inventory_id,
+            "created_at": str(row_value(row, "created_at", "") or ""),
+            "category": category,
+            "name": name,
+            "quantity": quantity,
+            "location": location,
+            "normalized_location": quality["normalized"],
+            "location_kind": quality["kind"],
+            "note": str(row_value(row, "note", "") or ""),
+            "created_by": str(row_value(row, "created_by", "") or ""),
+            "issues": issues,
+            "item_key": item_key,
+            "location_key": location_key,
+            "item_identity": item_identity,
+        }
+        entries.append(entry)
+        by_item_location.setdefault(item_key, []).append(entry)
+        if location_key:
+            by_location.setdefault(location_key, {}).setdefault(item_identity, []).append(entry)
+
+    for group in by_item_location.values():
+        if len(group) <= 1:
+            continue
+        detail = f"同一物料、同一仓位共有 {len(group)} 条入库记录，建议合并或删除重复项。"
+        for entry in group:
+            entry["issues"].append(inventory_audit_issue("duplicate_inventory_record", "warning", detail))
+
+    for location_key, items in by_location.items():
+        distinct_items = [key for key in items if key]
+        if len(distinct_items) <= 1:
+            continue
+        total_rows = sum(len(value) for value in items.values())
+        detail = f"仓位 {location_key} 下有 {len(distinct_items)} 种物料、{total_rows} 条记录，请确认是否混放。"
+        for group in items.values():
+            for entry in group:
+                entry["issues"].append(inventory_audit_issue("shared_location", "info", detail))
+
+    issue_entries = [entry for entry in entries if entry["issues"]]
+    for entry in issue_entries:
+        entry["issues"] = sorted(
+            entry["issues"],
+            key=lambda item: (INVENTORY_AUDIT_SEVERITY_RANK.get(item["severity"], 9), item["code"]),
+        )
+        entry["top_severity"] = entry["issues"][0]["severity"] if entry["issues"] else "info"
+
+    issue_entries.sort(
+        key=lambda item: (
+            INVENTORY_AUDIT_SEVERITY_RANK.get(item.get("top_severity"), 9),
+            item["location_key"],
+            item["category"],
+            item["name"],
+            item["id"],
+        )
+    )
+    limit = clamp_int(limit, 200, 20, 1000)
+    counts = {}
+    for entry in issue_entries:
+        seen_codes = set()
+        for issue in entry["issues"]:
+            code = issue["code"]
+            if code in seen_codes:
+                continue
+            counts[code] = counts.get(code, 0) + 1
+            seen_codes.add(code)
+    return {
+        "total_entries": len(entries),
+        "issue_entries": len(issue_entries),
+        "shown_entries": min(len(issue_entries), limit),
+        "limit": limit,
+        "issue_counts": counts,
+        "rows": issue_entries[:limit],
+    }
+
+
+def inventory_audit_payload(limit=200):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, category, name, quantity, location, note, created_by
+            FROM inventory
+            ORDER BY location COLLATE NOCASE ASC, category ASC, name ASC, id ASC
+            """
+        ).fetchall()
+    return inventory_audit_rows_from_entries(rows, limit=limit)
+
+
 def search_history_html(user, limit=10):
     with db() as conn:
         history = conn.execute(
@@ -13415,6 +13642,86 @@ def assistant_page(user):
     return render_layout("智能助手", body, user, "智能助手")
 
 
+def inventory_audit_issue_badges_html(issues):
+    badges = []
+    for issue in issues or []:
+        severity = html.escape(str(issue.get("severity") or "info"), quote=True)
+        label = html.escape(str(issue.get("label") or issue.get("code") or "问题"))
+        detail = html.escape(str(issue.get("detail") or ""), quote=True)
+        badges.append(f'<span class="inventory-audit-issue is-{severity}" title="{detail}">{label}</span>')
+    return "".join(badges) or '<span class="inventory-audit-issue is-info">待复核</span>'
+
+
+def inventory_audit_admin_panel_html(limit=200):
+    payload = inventory_audit_payload(limit=limit)
+    issue_counts = payload["issue_counts"]
+    count_cards = []
+    for code, count in sorted(issue_counts.items(), key=lambda item: (-item[1], item[0])):
+        count_cards.append(
+            f'<div><span>{html.escape(INVENTORY_AUDIT_ISSUE_LABELS.get(code, code))}</span><strong>{count}</strong></div>'
+        )
+    rows_html = []
+    for item in payload["rows"]:
+        inventory_id = parse_int(item.get("id"), 0)
+        issue_html = inventory_audit_issue_badges_html(item.get("issues"))
+        rows_html.append(
+            f"""
+            <tr class="inventory-audit-row" data-inventory-audit-row data-inventory-id="{inventory_id}">
+              <td>
+                <strong>#{inventory_id}</strong>
+                <small>{html.escape(item.get("created_at") or "")}</small>
+                <small>{html.escape(item.get("created_by") or "")}</small>
+              </td>
+              <td class="inventory-audit-issues">{issue_html}</td>
+              <td>
+                <form class="inventory-audit-form" data-inventory-audit-form action="/api/admin/inventory/{inventory_id}/audit-update">
+                  <div class="inventory-audit-edit-grid">
+                    <label>类别<input name="category" value="{html.escape(item.get("category") or "", quote=True)}" required></label>
+                    <label>名称<input name="name" value="{html.escape(item.get("name") or "", quote=True)}" required></label>
+                    <label>数量<input name="quantity" inputmode="numeric" pattern="\\d+" value="{html.escape(str(item.get("quantity") or 0), quote=True)}" required></label>
+                    <label>仓位<input name="location" value="{html.escape(item.get("location") or "", quote=True)}" placeholder="H1-07-04" required></label>
+                    <label class="wide">备注<textarea name="note" rows="2">{html.escape(item.get("note") or "")}</textarea></label>
+                    <label class="wide">修正原因<input name="reason" maxlength="1000" placeholder="例如：仓检确认位置迁移到 H1-07-04" required></label>
+                  </div>
+                  <div class="inventory-audit-actions">
+                    <button type="submit">保存修正</button>
+                    <button type="button" class="danger" data-inventory-audit-delete data-delete-url="/api/admin/inventory/{inventory_id}/audit-delete">删除记录</button>
+                    <span class="inventory-audit-status" role="status" aria-live="polite"></span>
+                  </div>
+                </form>
+              </td>
+            </tr>
+            """
+        )
+    empty = """
+            <tr><td colspan="3"><div class="empty">暂未发现明显的仓位、重复或数量异常。仓库数据看起来很干净。</div></td></tr>
+    """
+    count_cards_html = "".join(count_cards) or '<div><span>问题记录</span><strong>0</strong></div>'
+    if payload["issue_entries"] > payload["shown_entries"]:
+        shown_note = f"当前显示前 {payload['shown_entries']} 条；共有 {payload['issue_entries']} 条问题记录。"
+    else:
+        shown_note = f"当前显示 {payload['shown_entries']} 条问题记录。"
+    return f"""
+    <section class="panel inventory-audit-panel">
+      <div class="panel-head">
+        <h2>库存数据体检与修正</h2>
+        <span>Admin only · 全量比对 {payload["total_entries"]} 条库存记录</span>
+      </div>
+      <div class="inventory-audit-summary">
+        <div><span>问题记录</span><strong>{payload["issue_entries"]}</strong></div>
+        {count_cards_html}
+      </div>
+      <p class="muted">体检会标出仓位格式异常、H 仓位未精确到单格、同物料同仓位重复录入、同仓位多物料、数量异常和旧仓位格式。{html.escape(shown_note)}</p>
+      <div class="table-wrap inventory-audit-table-wrap">
+        <table class="inventory-audit-table">
+          <thead><tr><th>记录</th><th>问题</th><th>修正</th></tr></thead>
+          <tbody>{''.join(rows_html) or empty}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
 def reports_page(user, message=""):
     files = sorted(REPORTS_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
     items = "".join(
@@ -13423,6 +13730,8 @@ def reports_page(user, message=""):
     ) or "<li><span>暂无报表，可点击立即生成</span></li>"
     csv_link = f'/download?type=forms&name={urllib.parse.quote(CSV_PATH.name)}'
     lcsc_link = f'/download?type=lcsc&name={urllib.parse.quote(LCSC_CACHE_CSV.name)}'
+    admin_panel = inventory_audit_admin_panel_html() if is_admin_role(user) else ""
+    scripts = ["/static/report_audit.js"] if is_admin_role(user) else None
     body = f"""
     <header class="page-head"><div><p class="eyebrow">Reports</p><h1>仓检报表</h1></div></header>
     <section class="panel">
@@ -13439,8 +13748,9 @@ def reports_page(user, message=""):
       <div class="panel-head"><h2>文件</h2><span>{len(files)} 个 XLSX</span></div>
       <ul class="file-list">{items}</ul>
     </section>
+    {admin_panel}
     """
-    return render_layout("仓检报表", body, user, "仓检报表")
+    return render_layout("仓检报表", body, user, "仓检报表", scripts=scripts)
 
 
 def users_page(user, message="", error=""):
@@ -14447,6 +14757,12 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         transition_job_id = parse_analysis_job_status_path(parsed.path)
         if transition_job_id:
             return self.api_admin_update_analysis_job_status(user, transition_job_id)
+        admin_inventory_update_match = re.fullmatch(r"/api/admin/inventory/(\d+)/audit-update", parsed.path)
+        if admin_inventory_update_match:
+            return self.api_admin_update_inventory_entry(user, admin_inventory_update_match.group(1))
+        admin_inventory_delete_match = re.fullmatch(r"/api/admin/inventory/(\d+)/audit-delete", parsed.path)
+        if admin_inventory_delete_match:
+            return self.api_admin_delete_inventory_entry(user, admin_inventory_delete_match.group(1))
         if parsed.path.startswith("/api/inventory/") and parsed.path.endswith("/adjust"):
             inventory_id = urllib.parse.unquote(parsed.path[len("/api/inventory/") : -len("/adjust")]).strip()
             return self.api_adjust_inventory_quantity(user, inventory_id)
@@ -15028,6 +15344,152 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                 headers={"Content-Disposition": "attachment; " + content_disposition_filename(filename)},
             )
         return self.send_json(payload)
+
+    def api_admin_update_inventory_entry(self, user, inventory_id):
+        if not is_admin_role(user):
+            return self.send_json({"error": "Forbidden."}, HTTPStatus.FORBIDDEN)
+        if "application/json" not in self.headers.get("Content-Type", "").lower():
+            return self.send_json({"error": "Request must be application/json."}, HTTPStatus.BAD_REQUEST)
+        try:
+            payload = self.read_json()
+        except json.JSONDecodeError:
+            return self.send_json({"error": "Request JSON format is invalid."}, HTTPStatus.BAD_REQUEST)
+        if not isinstance(payload, dict):
+            return self.send_json({"error": "Request JSON must be an object."}, HTTPStatus.BAD_REQUEST)
+        inventory_id = parse_int(inventory_id, 0)
+        if inventory_id <= 0:
+            return self.send_json({"error": "Inventory entry not found."}, HTTPStatus.NOT_FOUND)
+
+        category = str(payload.get("category") or "").strip()[:240]
+        name = str(payload.get("name") or "").strip()[:500]
+        location = str(payload.get("location") or "").strip()[:240]
+        note = str(payload.get("note") or "").strip()[:1200]
+        reason = str(payload.get("reason") or "").strip()[:1000]
+        if not category or not name or not location:
+            return self.send_json({"error": "category, name and location are required."}, HTTPStatus.BAD_REQUEST)
+        if not reason:
+            return self.send_json({"error": "reason is required."}, HTTPStatus.BAD_REQUEST)
+        try:
+            quantity_after = parse_required_json_int(payload.get("quantity"), "quantity")
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if quantity_after < 0:
+            return self.send_json({"error": "quantity cannot be below zero."}, HTTPStatus.BAD_REQUEST)
+
+        with db() as conn:
+            row = conn.execute("SELECT * FROM inventory WHERE id = ?", (inventory_id,)).fetchone()
+            if not row:
+                return self.send_json({"error": "Inventory entry not found."}, HTTPStatus.NOT_FOUND)
+            quantity_before = parse_int(row["quantity"], 0)
+            before = {
+                "category": str(row["category"] or ""),
+                "name": str(row["name"] or ""),
+                "quantity": quantity_before,
+                "location": str(row["location"] or ""),
+                "note": str(row["note"] or ""),
+            }
+            after = {
+                "category": category,
+                "name": name,
+                "quantity": quantity_after,
+                "location": location,
+                "note": note,
+            }
+            changed_fields = [field for field, old_value in before.items() if old_value != after[field]]
+            if not changed_fields:
+                return self.send_json({"error": "No changes to save."}, HTTPStatus.BAD_REQUEST)
+
+            adjusted_at = now_text()
+            conn.execute(
+                """
+                UPDATE inventory
+                SET category = ?, name = ?, quantity = ?, location = ?, note = ?
+                WHERE id = ?
+                """,
+                (category, name, quantity_after, location, note, inventory_id),
+            )
+            change_detail = "；".join(
+                f"{field}: {before[field]} -> {after[field]}" for field in changed_fields
+            )
+            manual_adjustment_id = record_manual_inventory_adjustment(
+                conn,
+                owner_username=row["created_by"],
+                actor=user,
+                inventory_id=inventory_id,
+                action="audit_update",
+                source="inventory_audit_report",
+                category=category,
+                name=name,
+                location=location,
+                note=note,
+                quantity_before=quantity_before,
+                quantity_after=quantity_after,
+                quantity_delta=quantity_after - quantity_before,
+                reason=(reason + "；" + change_detail)[:1000],
+                created_at=adjusted_at,
+            )
+            updated_row = conn.execute("SELECT * FROM inventory WHERE id = ?", (inventory_id,)).fetchone()
+            inventory_entry = inventory_entry_from_row(updated_row)
+        export_current_inventory()
+        return self.send_json(
+            {
+                "inventory_entry": inventory_entry,
+                "manual_adjustment_id": manual_adjustment_id,
+                "changed_fields": changed_fields,
+                "message": "库存记录已修正，刷新页面可重新体检。",
+            }
+        )
+
+    def api_admin_delete_inventory_entry(self, user, inventory_id):
+        if not is_admin_role(user):
+            return self.send_json({"error": "Forbidden."}, HTTPStatus.FORBIDDEN)
+        if "application/json" not in self.headers.get("Content-Type", "").lower():
+            return self.send_json({"error": "Request must be application/json."}, HTTPStatus.BAD_REQUEST)
+        try:
+            payload = self.read_json()
+        except json.JSONDecodeError:
+            return self.send_json({"error": "Request JSON format is invalid."}, HTTPStatus.BAD_REQUEST)
+        if not isinstance(payload, dict):
+            return self.send_json({"error": "Request JSON must be an object."}, HTTPStatus.BAD_REQUEST)
+        inventory_id = parse_int(inventory_id, 0)
+        if inventory_id <= 0:
+            return self.send_json({"error": "Inventory entry not found."}, HTTPStatus.NOT_FOUND)
+        reason = str(payload.get("reason") or "").strip()[:1000]
+        if not reason:
+            return self.send_json({"error": "reason is required before deleting an inventory record."}, HTTPStatus.BAD_REQUEST)
+
+        with db() as conn:
+            row = conn.execute("SELECT * FROM inventory WHERE id = ?", (inventory_id,)).fetchone()
+            if not row:
+                return self.send_json({"error": "Inventory entry not found."}, HTTPStatus.NOT_FOUND)
+            quantity_before = parse_int(row["quantity"], 0)
+            deleted_at = now_text()
+            manual_adjustment_id = record_manual_inventory_adjustment(
+                conn,
+                owner_username=row["created_by"],
+                actor=user,
+                inventory_id=inventory_id,
+                action="delete",
+                source="inventory_audit_report",
+                category=row["category"],
+                name=row["name"],
+                location=row["location"],
+                note=row["note"] or "",
+                quantity_before=quantity_before,
+                quantity_after=0,
+                quantity_delta=-quantity_before,
+                reason=reason,
+                created_at=deleted_at,
+            )
+            conn.execute("DELETE FROM inventory WHERE id = ?", (inventory_id,))
+        export_current_inventory()
+        return self.send_json(
+            {
+                "deleted_inventory_id": inventory_id,
+                "manual_adjustment_id": manual_adjustment_id,
+                "message": "库存记录已删除，删除动作已写入手动调整台账。",
+            }
+        )
 
     def api_adjust_inventory_quantity(self, user, inventory_id):
         if "application/json" not in self.headers.get("Content-Type", "").lower():

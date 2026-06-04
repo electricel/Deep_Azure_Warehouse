@@ -133,6 +133,75 @@ class InventoryLocationSearchTests(unittest.TestCase):
         )
 
 
+class InventoryAuditTests(unittest.TestCase):
+    def test_location_quality_flags_coarse_invalid_and_legacy_locations(self):
+        coarse = app.inventory_location_quality("H1-07")
+        invalid = app.inventory_location_quality("H31-01-01")
+        legacy = app.inventory_location_quality("A1-L1-01")
+
+        self.assertIn("coarse_device_location", {item["code"] for item in coarse["issues"]})
+        self.assertIn("invalid_location_format", {item["code"] for item in invalid["issues"]})
+        self.assertIn("legacy_location", {item["code"] for item in legacy["issues"]})
+
+    def test_inventory_audit_detects_duplicate_and_shared_locations(self):
+        rows = [
+            {
+                "id": 1,
+                "created_at": "2026-06-01 10:00:00",
+                "category": "电容",
+                "name": "100nF / C0603",
+                "quantity": 20,
+                "location": "H1-07-04",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 2,
+                "created_at": "2026-06-01 10:01:00",
+                "category": "电容",
+                "name": "100nF / C0603",
+                "quantity": 10,
+                "location": "H01-7-4",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 3,
+                "created_at": "2026-06-01 10:02:00",
+                "category": "电阻",
+                "name": "10k / R0603",
+                "quantity": 30,
+                "location": "H1-07-04",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 4,
+                "created_at": "2026-06-01 10:03:00",
+                "category": "模块",
+                "name": "降压模块",
+                "quantity": 0,
+                "location": "待定",
+                "note": "",
+                "created_by": "admin",
+            },
+        ]
+
+        payload = app.inventory_audit_rows_from_entries(rows)
+        issues_by_id = {
+            item["id"]: {issue["code"] for issue in item["issues"]}
+            for item in payload["rows"]
+        }
+
+        self.assertEqual(payload["total_entries"], 4)
+        self.assertIn("duplicate_inventory_record", issues_by_id[1])
+        self.assertIn("duplicate_inventory_record", issues_by_id[2])
+        self.assertIn("shared_location", issues_by_id[1])
+        self.assertIn("shared_location", issues_by_id[3])
+        self.assertIn("placeholder_location", issues_by_id[4])
+        self.assertIn("non_positive_quantity", issues_by_id[4])
+
+
 class SecurityOriginTests(unittest.TestCase):
     def test_localhost_origin_with_configured_port_is_allowed(self):
         origins = app.configured_allowed_origins()

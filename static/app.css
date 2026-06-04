@@ -5043,6 +5043,164 @@ body.pcb-keyframe-lab-page::before {
   text-align: center;
 }
 
+.inventory-audit-panel {
+  border-color: rgba(225, 88, 70, 0.22);
+}
+
+.inventory-audit-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.inventory-audit-summary div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,0.58);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.48);
+}
+
+.inventory-audit-summary span {
+  color: #687385;
+  font-size: 12px;
+}
+
+.inventory-audit-summary strong {
+  color: #18324c;
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}
+
+.inventory-audit-table-wrap {
+  max-height: 680px;
+}
+
+.inventory-audit-table th,
+.inventory-audit-table td {
+  vertical-align: top;
+}
+
+.inventory-audit-table td:first-child {
+  min-width: 112px;
+}
+
+.inventory-audit-table td:first-child strong,
+.inventory-audit-table td:first-child small {
+  display: block;
+}
+
+.inventory-audit-table td:first-child small {
+  margin-top: 4px;
+  color: #687385;
+  font-size: 11px;
+}
+
+.inventory-audit-issues {
+  min-width: 160px;
+}
+
+.inventory-audit-issue {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 5px 5px 0;
+  padding: 4px 7px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.inventory-audit-issue.is-error {
+  color: #8f1d17;
+  background: rgba(255, 218, 214, 0.82);
+}
+
+.inventory-audit-issue.is-warning {
+  color: #7a4a00;
+  background: rgba(255, 235, 194, 0.9);
+}
+
+.inventory-audit-issue.is-info {
+  color: #285276;
+  background: rgba(215, 236, 255, 0.9);
+}
+
+.inventory-audit-form {
+  display: grid;
+  gap: 8px;
+  min-width: 560px;
+}
+
+.inventory-audit-edit-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1.4fr) 76px minmax(120px, 0.9fr);
+  gap: 8px;
+}
+
+.inventory-audit-edit-grid label {
+  display: grid;
+  gap: 4px;
+  color: #566273;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.inventory-audit-edit-grid .wide {
+  grid-column: 1 / -1;
+}
+
+.inventory-audit-edit-grid input,
+.inventory-audit-edit-grid textarea {
+  width: 100%;
+  min-height: 34px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.inventory-audit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.inventory-audit-actions button {
+  min-height: 34px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.inventory-audit-actions .danger {
+  border-color: rgba(170, 38, 26, 0.34);
+  color: #8f1d17;
+  background: rgba(255, 231, 228, 0.86);
+}
+
+.inventory-audit-status {
+  min-width: 180px;
+  color: #667386;
+  font-size: 12px;
+}
+
+.inventory-audit-status.is-ok {
+  color: #166744;
+}
+
+.inventory-audit-status.is-error {
+  color: #9b1c1c;
+}
+
+.inventory-audit-row.is-updated {
+  background: rgba(218, 245, 232, 0.42);
+}
+
+.inventory-audit-row.is-deleted {
+  opacity: 0.42;
+}
+
 .step-preview-panel {
   display: grid;
   gap: 12px;
