@@ -2,6 +2,7 @@ import sqlite3
 import unittest
 
 import app
+import warehouse_bom as bom_tools
 
 
 class BomMatchingTests(unittest.TestCase):
@@ -12,7 +13,7 @@ class BomMatchingTests(unittest.TestCase):
             ["C2", "100nF", "C0805", "3"],
         ]
 
-        items = app.parse_bom_rows(rows)
+        items = bom_tools.parse_bom_rows(rows)
 
         self.assertEqual(len(items), 2)
         by_package = {item["package"]: item for item in items}
@@ -81,6 +82,124 @@ class BomMatchingTests(unittest.TestCase):
         )
 
         self.assertEqual(stock, 0)
+
+
+class InventoryLocationSearchTests(unittest.TestCase):
+    def assert_location_query_matches(self, query, locations, expected):
+        plan = app.inventory_smart_search_plan({"q": [query]})
+        self.assertTrue(plan["has_search"])
+        self.assertTrue(plan["location_search"])
+        self.assertEqual(plan["order_by"], "location")
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE inventory (location TEXT)")
+        conn.executemany("INSERT INTO inventory (location) VALUES (?)", [(item,) for item in locations])
+
+        where = " AND ".join(plan["filters"])
+        rows = conn.execute(
+            f"SELECT location FROM inventory WHERE {where} ORDER BY location COLLATE NOCASE",
+            plan["params"],
+        ).fetchall()
+
+        self.assertEqual([row["location"] for row in rows], expected)
+
+    def test_device_location_token_normalizes_to_canonical_cell(self):
+        location = app.normalize_inventory_device_location_token("H01-7-4")
+
+        self.assertIsNotNone(location)
+        self.assertEqual(location["canonical"], "H1-07-04")
+        self.assertEqual(location["level"], "cell")
+
+    def test_device_box_location_search_does_not_match_other_boxes(self):
+        self.assert_location_query_matches(
+            "H1",
+            ["H1", "H1-01-01", "H01-02-03", "H10-01-01", "H2-01-01"],
+            ["H01-02-03", "H1", "H1-01-01"],
+        )
+
+    def test_device_strip_location_search_matches_only_that_strip(self):
+        self.assert_location_query_matches(
+            "H1-07",
+            ["H1-07", "H1-07-01", "H1-07-04", "H1-08-01", "H10-07-01"],
+            ["H1-07", "H1-07-01", "H1-07-04"],
+        )
+
+    def test_device_cell_location_search_matches_exact_cell_only(self):
+        self.assert_location_query_matches(
+            "H1-07-04",
+            ["H1-07-04", "H1-7-4", "H01-07-04", "H1-07-03", "H1-07-04-extra"],
+            ["H01-07-04", "H1-07-04", "H1-7-4"],
+        )
+
+
+class InventoryAuditTests(unittest.TestCase):
+    def test_location_quality_flags_coarse_invalid_and_legacy_locations(self):
+        coarse = app.inventory_location_quality("H1-07")
+        invalid = app.inventory_location_quality("H31-01-01")
+        legacy = app.inventory_location_quality("A1-L1-01")
+
+        self.assertIn("coarse_device_location", {item["code"] for item in coarse["issues"]})
+        self.assertIn("invalid_location_format", {item["code"] for item in invalid["issues"]})
+        self.assertIn("legacy_location", {item["code"] for item in legacy["issues"]})
+
+    def test_inventory_audit_detects_duplicate_and_shared_locations(self):
+        rows = [
+            {
+                "id": 1,
+                "created_at": "2026-06-01 10:00:00",
+                "category": "电容",
+                "name": "100nF / C0603",
+                "quantity": 20,
+                "location": "H1-07-04",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 2,
+                "created_at": "2026-06-01 10:01:00",
+                "category": "电容",
+                "name": "100nF / C0603",
+                "quantity": 10,
+                "location": "H01-7-4",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 3,
+                "created_at": "2026-06-01 10:02:00",
+                "category": "电阻",
+                "name": "10k / R0603",
+                "quantity": 30,
+                "location": "H1-07-04",
+                "note": "",
+                "created_by": "admin",
+            },
+            {
+                "id": 4,
+                "created_at": "2026-06-01 10:03:00",
+                "category": "模块",
+                "name": "降压模块",
+                "quantity": 0,
+                "location": "待定",
+                "note": "",
+                "created_by": "admin",
+            },
+        ]
+
+        payload = app.inventory_audit_rows_from_entries(rows)
+        issues_by_id = {
+            item["id"]: {issue["code"] for issue in item["issues"]}
+            for item in payload["rows"]
+        }
+
+        self.assertEqual(payload["total_entries"], 4)
+        self.assertIn("duplicate_inventory_record", issues_by_id[1])
+        self.assertIn("duplicate_inventory_record", issues_by_id[2])
+        self.assertIn("shared_location", issues_by_id[1])
+        self.assertIn("shared_location", issues_by_id[3])
+        self.assertIn("placeholder_location", issues_by_id[4])
+        self.assertIn("non_positive_quantity", issues_by_id[4])
 
 
 class SecurityOriginTests(unittest.TestCase):
