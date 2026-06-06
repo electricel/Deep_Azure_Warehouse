@@ -143,6 +143,7 @@ LCSC_DIR = DATA_DIR / "lcsc"
 USER_KNOWLEDGE_DIR = DATA_DIR / "user_knowledge"
 WORKFLOW_UPLOADS_DIR = DATA_DIR / "workflow_uploads"
 COMPETITION_MATERIALS_DIR = DATA_DIR / "competition_materials"
+COMPETITION_MATERIAL_PHOTOS_DIR = COMPETITION_MATERIALS_DIR / "photos"
 LCSC_CACHE_JSON = LCSC_DIR / "lcsc_products.json"
 LCSC_CACHE_CSV = LCSC_DIR / "lcsc_products.csv"
 LCSC_CATEGORIES_JSON = LCSC_DIR / "lcsc_categories.json"
@@ -564,6 +565,7 @@ def ensure_dirs():
         USER_KNOWLEDGE_DIR,
         WORKFLOW_UPLOADS_DIR,
         COMPETITION_MATERIALS_DIR,
+        COMPETITION_MATERIAL_PHOTOS_DIR,
     ):
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -1124,10 +1126,22 @@ def init_db():
             )
             """
         )
+        ensure_column(conn, "competition_material_items", "material_type", "material_type TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "robot_class", "robot_class TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "storage_location", "storage_location TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "photo_path", "photo_path TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "photo_mime_type", "photo_mime_type TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "photo_original_name", "photo_original_name TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "linked_inventory_id", "linked_inventory_id INTEGER")
+        ensure_column(conn, "competition_material_items", "pcb_bom_id", "pcb_bom_id TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "pcb_file_id", "pcb_file_id TEXT DEFAULT ''")
+        ensure_column(conn, "competition_material_items", "pcb_label", "pcb_label TEXT DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_boms_bom ON competition_material_boms (bom_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_items_bom ON competition_material_items (bom_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_items_name ON competition_material_items (category, name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_items_owner ON competition_material_items (owner_name, owner_group)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_items_type ON competition_material_items (material_type, robot_class)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_competition_material_items_storage ON competition_material_items (storage_location)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS assistant_messages (
@@ -5267,6 +5281,7 @@ DEFAULT_IMAGE_RECOGNITION_CONFIG = {
 }
 
 INVENTORY_IMAGE_FIELD_NAMES = ("inventory_image", "image", "file", "photo")
+COMPETITION_MATERIAL_IMAGE_FIELD_NAMES = ("competition_photo", "spare_photo", "photo", "image", "file")
 INVENTORY_IMAGE_ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 INVENTORY_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
@@ -8637,7 +8652,11 @@ COMPETITION_MATERIAL_CATEGORIES = (
     "机械结构",
     "铝管/型材",
     "碳板/板材",
+    "气动元件",
+    "气泵",
+    "电磁阀",
     "紧固件",
+    "螺栓/螺母",
     "电控模块",
     "硬件器件",
     "线材/接插件",
@@ -8648,6 +8667,33 @@ COMPETITION_MATERIAL_CATEGORIES = (
     "其他",
 )
 
+COMPETITION_MATERIAL_TYPES = {
+    "mechanical": "机械类",
+    "hardware": "硬件类",
+    "consumable": "通用耗材",
+    "tool": "工具/赛场",
+    "valuable": "贵重物品",
+    "other": "其他",
+}
+
+COMPETITION_ROBOT_CLASSES = {
+    "robot_a": "机器人 1",
+    "robot_b": "机器人 2",
+    "shared": "双车通用",
+    "pit": "赛场通用",
+}
+
+COMPETITION_MECHANICAL_CATEGORIES = {
+    "机械结构",
+    "铝管/型材",
+    "碳板/板材",
+    "气动元件",
+    "气泵",
+    "电磁阀",
+    "紧固件",
+    "螺栓/螺母",
+}
+
 COMPETITION_HARDWARE_CATEGORIES = {
     "硬件器件",
     "电控模块",
@@ -8655,6 +8701,69 @@ COMPETITION_HARDWARE_CATEGORIES = {
     "传感器",
     "电机/执行器",
 }
+
+
+def competition_material_type_label(value):
+    return COMPETITION_MATERIAL_TYPES.get(str(value or "").strip(), "其他")
+
+
+def competition_robot_class_label(value):
+    return COMPETITION_ROBOT_CLASSES.get(str(value or "").strip(), "双车通用")
+
+
+def infer_competition_material_type(category, name="", spec=""):
+    text = f"{category} {name} {spec}".lower()
+    if category in COMPETITION_MECHANICAL_CATEGORIES or any(
+        token in text
+        for token in ("铝管", "型材", "碳板", "板材", "气泵", "电磁阀", "气管", "螺栓", "螺母", "结构", "机械")
+    ):
+        return "mechanical"
+    if category in COMPETITION_HARDWARE_CATEGORIES or competition_material_should_compare(category, name, spec):
+        return "hardware"
+    if "贵重" in str(category or "") or "贵重" in text:
+        return "valuable"
+    if "工具" in str(category or "") or "工具" in text:
+        return "tool"
+    if "耗材" in str(category or "") or "耗材" in text:
+        return "consumable"
+    return "other"
+
+
+def normalize_competition_material_type(value, category="", name="", spec=""):
+    text = str(value or "").strip().lower()
+    aliases = {
+        "机械": "mechanical",
+        "机械类": "mechanical",
+        "mechanical": "mechanical",
+        "硬件": "hardware",
+        "硬件类": "hardware",
+        "hardware": "hardware",
+        "耗材": "consumable",
+        "通用耗材": "consumable",
+        "consumable": "consumable",
+        "工具": "tool",
+        "tool": "tool",
+        "贵重": "valuable",
+        "贵重物品": "valuable",
+        "valuable": "valuable",
+        "其他": "other",
+        "other": "other",
+    }
+    return aliases.get(text) or infer_competition_material_type(category, name, spec)
+
+
+def normalize_competition_robot_class(value, robot_name=""):
+    text = str(value or "").strip().lower()
+    combined = f"{value} {robot_name}".lower()
+    if text in COMPETITION_ROBOT_CLASSES:
+        return text
+    if any(token in combined for token in ("机器人1", "机器人 1", "robot1", "robot 1", "一号", "1号")):
+        return "robot_a"
+    if any(token in combined for token in ("机器人2", "机器人 2", "robot2", "robot 2", "二号", "2号")):
+        return "robot_b"
+    if any(token in combined for token in ("赛场", "pit", "工具", "维修")):
+        return "pit"
+    return "shared"
 
 
 def competition_material_should_compare(category, name="", spec=""):
@@ -8689,6 +8798,7 @@ def competition_material_aliases(row):
         row_value(row, "name", ""),
         row_value(row, "spec", ""),
         row_value(row, "note", ""),
+        row_value(row, "pcb_label", ""),
     ]
     values.extend(extract_lcsc_codes(values))
     aliases = []
@@ -8699,24 +8809,235 @@ def competition_material_aliases(row):
     return aliases[:20]
 
 
-def normalize_competition_material_form(form, user):
-    category = (form.get("category", [""])[0] or "").strip()[:80] or "其他"
-    name = (form.get("name", [""])[0] or "").strip()[:180]
-    spec = (form.get("spec", [""])[0] or "").strip()[:180]
+def competition_material_photo_url(row_or_id):
+    inventory_id = row_or_id
+    photo_path = ""
+    if isinstance(row_or_id, dict) or hasattr(row_or_id, "keys"):
+        inventory_id = row_value(row_or_id, "id", 0)
+        photo_path = row_value(row_or_id, "photo_path", "")
+    if not parse_int(inventory_id, 0) or (isinstance(row_or_id, (dict, sqlite3.Row)) and not photo_path):
+        return ""
+    return f"/spares/photo/{parse_int(inventory_id, 0)}"
+
+
+def store_competition_material_photo(upload):
+    if not upload or not upload.get("filename"):
+        return {}
+    filename = safe_name(upload.get("filename") or "competition_spare_photo")
+    content = upload.get("content") or b""
+    if not content:
+        return {}
+    if len(content) > INVENTORY_IMAGE_MAX_BYTES:
+        raise ValueError("比赛备件照片超过 8MB，请压缩后再上传。")
+    mime_type = str(upload.get("content_type") or mimetypes.guess_type(filename)[0] or "").split(";", 1)[0].lower()
+    if mime_type not in INVENTORY_IMAGE_ALLOWED_MIME_TYPES:
+        raise ValueError("比赛备件照片仅支持 JPG、PNG、WEBP 或 GIF。")
+    suffix = mimetypes.guess_extension(mime_type) or Path(filename).suffix.lower() or ".jpg"
+    stored = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{secrets.token_hex(4)}{suffix}"
+    target = COMPETITION_MATERIAL_PHOTOS_DIR / stored
+    write_data_bytes(target, content)
+    return {
+        "photo_path": data_relative_path(target),
+        "photo_mime_type": mime_type,
+        "photo_original_name": filename,
+    }
+
+
+def competition_category_from_recognition(category, name="", spec=""):
+    raw = str(category or "").strip()
+    text = f"{raw} {name} {spec}".lower()
+    mechanical_map = (
+        ("铝管", "铝管/型材"),
+        ("型材", "铝管/型材"),
+        ("碳板", "碳板/板材"),
+        ("板材", "碳板/板材"),
+        ("气泵", "气泵"),
+        ("电磁阀", "电磁阀"),
+        ("气管", "气动元件"),
+        ("气动", "气动元件"),
+        ("螺栓", "螺栓/螺母"),
+        ("螺母", "螺栓/螺母"),
+        ("螺丝", "紧固件"),
+        ("紧固", "紧固件"),
+        ("结构", "机械结构"),
+    )
+    for token, mapped in mechanical_map:
+        if token in text:
+            return mapped
+    hardware_map = (
+        ("传感器", "传感器"),
+        ("电机", "电机/执行器"),
+        ("舵机", "电机/执行器"),
+        ("模块", "电控模块"),
+        ("降压", "电控模块"),
+        ("线材", "线材/接插件"),
+        ("接插件", "线材/接插件"),
+        ("连接器", "线材/接插件"),
+    )
+    for token, mapped in hardware_map:
+        if token in text:
+            return mapped
+    if raw in COMPETITION_MATERIAL_CATEGORIES:
+        return raw
+    if competition_material_should_compare(raw, name, spec):
+        return "硬件器件"
+    return raw[:80] or "其他"
+
+
+def competition_image_item_from_inventory_item(item):
+    item = item or {}
+    spec_parts = [
+        str(item.get("value_spec") or "").strip(),
+        str(item.get("package") or "").strip(),
+        str(item.get("voltage") or "").strip(),
+        str(item.get("brand") or "").strip(),
+        str(item.get("lcsc_code") or "").strip(),
+    ]
+    spec = " / ".join(part for part in spec_parts if part)[:180]
+    name = str(item.get("name") or "").strip()[:180]
+    category = competition_category_from_recognition(item.get("category"), name, spec)
+    material_type = normalize_competition_material_type("", category, name, spec)
+    note_parts = []
+    if item.get("note"):
+        note_parts.append(str(item.get("note")).strip())
+    if item.get("product_url"):
+        note_parts.append(f"链接：{str(item.get('product_url')).strip()}")
+    if item.get("lcsc_code"):
+        note_parts.append(f"LCSC：{str(item.get('lcsc_code')).strip().upper()}")
+    return {
+        "category": category,
+        "material_type": material_type,
+        "material_type_label": competition_material_type_label(material_type),
+        "name": name,
+        "spec": spec,
+        "quantity": max(1, parse_int(item.get("quantity"), 1)),
+        "unit": "个",
+        "storage_location": str(item.get("location") or "").strip()[:120],
+        "note": "；".join(part for part in note_parts if part)[:500],
+        "hardware_compare": 1 if material_type == "hardware" or competition_material_should_compare(category, name, spec) else 0,
+        "confidence": item.get("confidence", ""),
+        "raw_inventory_item": item,
+    }
+
+
+def competition_image_recognition_payload(result):
+    mapped = [competition_image_item_from_inventory_item(item) for item in (result.get("items") or [])]
+    return {
+        "items": mapped,
+        "raw_items": result.get("items") or [],
+        "raw_text": result.get("raw_text") or "",
+        "model": result.get("model") or "",
+        "filename": result.get("filename") or "",
+        "mime_type": result.get("mime_type") or "",
+        "updated_at": result.get("updated_at") or now_text(),
+    }
+
+
+def competition_pcb_options(limit=160):
+    options = []
+    for record in load_bom_records():
+        bom_id = str(record.get("bom_id") or "").strip()
+        if not bom_id:
+            continue
+        title = str(record.get("title") or record.get("original_name") or bom_id).strip()
+        pcb_files = record.get("pcb_files") if isinstance(record.get("pcb_files"), list) else []
+        for item in pcb_files:
+            if not isinstance(item, dict):
+                continue
+            file_id = pcb_file_metadata_id(item)
+            if not file_id:
+                continue
+            filename = str(item.get("original_filename") or item.get("stored_filename") or file_id)
+            label = f"{title} / {filename}"
+            options.append({"value": f"{bom_id}|{file_id}", "label": label[:180], "bom_id": bom_id, "pcb_file_id": file_id})
+            if len(options) >= limit:
+                return options
+    return options
+
+
+def parse_competition_pcb_ref(value):
+    text = str(value or "").strip()
+    if not text:
+        return {"pcb_bom_id": "", "pcb_file_id": "", "pcb_label": ""}
+    bom_id, sep, file_id = text.partition("|")
+    bom_id = bom_id.strip()
+    file_id = file_id.strip() if sep else ""
+    if not bom_id:
+        return {"pcb_bom_id": "", "pcb_file_id": "", "pcb_label": text[:180]}
+    record = find_bom_record(bom_id)
+    label = text[:180]
+    if record:
+        title = str(record.get("title") or record.get("original_name") or bom_id)
+        metadata = find_pcb_file_metadata(record, file_id) if file_id else None
+        if metadata:
+            label = f"{title} / {metadata.get('original_filename') or metadata.get('stored_filename') or file_id}"
+        else:
+            label = title
+    return {"pcb_bom_id": bom_id[:120], "pcb_file_id": file_id[:160], "pcb_label": label[:180]}
+
+
+def competition_inventory_link_options(limit=120):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, category, name, quantity, location, created_by
+            FROM inventory
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (max(1, min(parse_int(limit, 120), 300)),),
+        ).fetchall()
+    return [
+        {
+            "id": parse_int(row["id"], 0),
+            "label": f"#{row['id']} {row['category']} / {row['name']} / {row['location']} / {row['quantity']}",
+        }
+        for row in rows
+    ]
+
+
+def linked_inventory_snapshot(conn, inventory_id):
+    inventory_id = parse_int(inventory_id, 0)
+    if inventory_id <= 0:
+        return None
+    return conn.execute(
+        "SELECT id, category, name, quantity, location, note, created_by, created_at FROM inventory WHERE id = ?",
+        (inventory_id,),
+    ).fetchone()
+
+
+def normalize_competition_material_form(form, user, photo_meta=None):
+    category = str(payload_value(form, "category") or "").strip()[:80] or "其他"
+    name = str(payload_value(form, "name") or "").strip()[:180]
+    spec = str(payload_value(form, "spec") or "").strip()[:180]
     if not name:
         raise ValueError("请填写物资名称。")
-    quantity = max(1, parse_int(form.get("quantity", ["1"])[0], 1))
-    unit = (form.get("unit", ["个"])[0] or "个").strip()[:20]
-    owner_name = (form.get("owner_name", [""])[0] or "").strip()[:80]
-    owner_group = (form.get("owner_group", [""])[0] or "").strip()[:80]
+    quantity = max(1, parse_int(payload_value(form, "quantity") or "1", 1))
+    unit = str(payload_value(form, "unit") or "个").strip()[:20]
+    owner_name = str(payload_value(form, "owner_name") or "").strip()[:80]
+    owner_group = str(payload_value(form, "owner_group") or "").strip()[:80]
     if not owner_name:
         raise ValueError("比赛物资必须填写责任人姓名。")
     if not owner_group:
         owner_group = str(user["team_group"] if "team_group" in user.keys() else "").strip() or "未分组"
+    robot_name = str(payload_value(form, "robot_name") or "").strip()[:80]
+    material_type = normalize_competition_material_type(payload_value(form, "material_type"), category, name, spec)
+    robot_class = normalize_competition_robot_class(payload_value(form, "robot_class"), robot_name)
+    storage_location = str(payload_value(form, "storage_location", "location") or "").strip()[:120]
+    hardware_compare = (
+        material_type == "hardware"
+        or truthy_value(payload_value(form, "hardware_compare"))
+        or competition_material_should_compare(category, name, spec)
+    )
+    pcb_info = parse_competition_pcb_ref(payload_value(form, "pcb_ref"))
+    linked_inventory_id = max(0, parse_int(payload_value(form, "linked_inventory_id"), 0))
+    photo_meta = photo_meta or {}
     return {
         "source_type": "manual",
         "bom_id": "",
-        "robot_name": (form.get("robot_name", [""])[0] or "").strip()[:80],
+        "robot_name": robot_name,
+        "material_type": material_type,
+        "robot_class": robot_class,
         "category": category,
         "name": name,
         "spec": spec,
@@ -8724,9 +9045,15 @@ def normalize_competition_material_form(form, user):
         "unit": unit,
         "owner_name": owner_name,
         "owner_group": owner_group,
-        "responsible_by": (form.get("responsible_by", [""])[0] or "").strip()[:80],
-        "note": (form.get("note", [""])[0] or "").strip()[:500],
-        "hardware_compare": 1 if truthy_value(form.get("hardware_compare", [""])[0]) or competition_material_should_compare(category, name, spec) else 0,
+        "storage_location": storage_location,
+        "responsible_by": str(payload_value(form, "responsible_by") or "").strip()[:80],
+        "note": str(payload_value(form, "note") or "").strip()[:500],
+        "hardware_compare": 1 if hardware_compare else 0,
+        "linked_inventory_id": linked_inventory_id,
+        **pcb_info,
+        "photo_path": photo_meta.get("photo_path", ""),
+        "photo_mime_type": photo_meta.get("photo_mime_type", ""),
+        "photo_original_name": photo_meta.get("photo_original_name", ""),
     }
 
 
@@ -8737,9 +9064,11 @@ def insert_competition_material_item(conn, item, user, created_at=None):
         INSERT INTO competition_material_items (
             source_type, bom_id, robot_name, category, name, spec, quantity, unit,
             owner_name, owner_group, responsible_by, note, hardware_compare,
+            material_type, robot_class, storage_location, photo_path, photo_mime_type,
+            photo_original_name, linked_inventory_id, pcb_bom_id, pcb_file_id, pcb_label,
             created_by, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item.get("source_type") or "manual",
@@ -8755,14 +9084,24 @@ def insert_competition_material_item(conn, item, user, created_at=None):
             item.get("responsible_by") or "",
             item.get("note") or "",
             1 if item.get("hardware_compare") else 0,
+            item.get("material_type") or infer_competition_material_type(item.get("category"), item.get("name"), item.get("spec")),
+            item.get("robot_class") or normalize_competition_robot_class("", item.get("robot_name")),
+            item.get("storage_location") or "",
+            item.get("photo_path") or "",
+            item.get("photo_mime_type") or "",
+            item.get("photo_original_name") or "",
+            parse_int(item.get("linked_inventory_id"), 0) or None,
+            item.get("pcb_bom_id") or "",
+            item.get("pcb_file_id") or "",
+            item.get("pcb_label") or "",
             user["username"],
             created_at,
         ),
     )
 
 
-def create_competition_material_manual_item(user, form):
-    item = normalize_competition_material_form(form, user)
+def create_competition_material_manual_item(user, form, photo_meta=None):
+    item = normalize_competition_material_form(form, user, photo_meta=photo_meta)
     created_at = now_text()
     with db() as conn:
         insert_competition_material_item(conn, item, user, created_at)
@@ -8812,6 +9151,8 @@ def create_competition_material_bom(user, title, robot_name, season, owner_name,
                 "source_type": "bom",
                 "bom_id": bom_id,
                 "robot_name": robot_name,
+                "material_type": normalize_competition_material_type("", category, name, spec),
+                "robot_class": normalize_competition_robot_class("", robot_name),
                 "category": category,
                 "name": name,
                 "spec": spec,
@@ -8822,9 +9163,73 @@ def create_competition_material_bom(user, title, robot_name, season, owner_name,
                 "responsible_by": user["username"],
                 "note": f"来自比赛物资 BOM：{title}",
                 "hardware_compare": 1 if competition_material_should_compare(category, name, spec) else 0,
+                "storage_location": "",
+                "linked_inventory_id": 0,
+                "pcb_bom_id": "",
+                "pcb_file_id": "",
+                "pcb_label": "",
             }
             insert_competition_material_item(conn, item, user, now)
     return {"bom_id": bom_id, "title": title, "item_count": len(detail["items"])}
+
+
+def competition_material_row_dict(row):
+    material_type = row_value(row, "material_type", "") or infer_competition_material_type(
+        row_value(row, "category", ""),
+        row_value(row, "name", ""),
+        row_value(row, "spec", ""),
+    )
+    robot_class = row_value(row, "robot_class", "") or normalize_competition_robot_class("", row_value(row, "robot_name", ""))
+    return {
+        "id": parse_int(row_value(row, "id"), 0),
+        "source_type": str(row_value(row, "source_type", "") or ""),
+        "bom_id": str(row_value(row, "bom_id", "") or ""),
+        "robot_name": str(row_value(row, "robot_name", "") or ""),
+        "robot_class": robot_class,
+        "robot_class_label": competition_robot_class_label(robot_class),
+        "material_type": material_type,
+        "material_type_label": competition_material_type_label(material_type),
+        "category": str(row_value(row, "category", "") or ""),
+        "name": str(row_value(row, "name", "") or ""),
+        "spec": str(row_value(row, "spec", "") or ""),
+        "quantity": parse_int(row_value(row, "quantity"), 0),
+        "unit": str(row_value(row, "unit", "") or "个"),
+        "owner_name": str(row_value(row, "owner_name", "") or ""),
+        "owner_group": str(row_value(row, "owner_group", "") or ""),
+        "storage_location": str(row_value(row, "storage_location", "") or ""),
+        "responsible_by": str(row_value(row, "responsible_by", "") or ""),
+        "note": str(row_value(row, "note", "") or ""),
+        "hardware_compare": parse_int(row_value(row, "hardware_compare", 0), 0),
+        "photo_path": str(row_value(row, "photo_path", "") or ""),
+        "photo_mime_type": str(row_value(row, "photo_mime_type", "") or ""),
+        "photo_original_name": str(row_value(row, "photo_original_name", "") or ""),
+        "linked_inventory_id": parse_int(row_value(row, "linked_inventory_id"), 0),
+        "pcb_bom_id": str(row_value(row, "pcb_bom_id", "") or ""),
+        "pcb_file_id": str(row_value(row, "pcb_file_id", "") or ""),
+        "pcb_label": str(row_value(row, "pcb_label", "") or ""),
+        "created_by": str(row_value(row, "created_by", "") or ""),
+        "created_at": str(row_value(row, "created_at", "") or ""),
+    }
+
+
+def competition_material_storage_location_clause(token):
+    device = normalize_inventory_device_location_token(token)
+    if not device:
+        return "", []
+    expression = "UPPER(TRIM(storage_location))"
+    clauses = []
+    params = []
+    for variant in device["variants"]:
+        upper_variant = str(variant).upper()
+        if device["level"] == "cell":
+            clauses.append(f"{expression} = ?")
+            params.append(upper_variant)
+        else:
+            clauses.append(f"({expression} = ? OR {expression} LIKE ? ESCAPE '\\')")
+            params.extend([upper_variant, inventory_prefix_like_value(upper_variant + "-")])
+    if not clauses:
+        return "", []
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def competition_material_rows(query=None, limit=120):
@@ -8832,11 +9237,35 @@ def competition_material_rows(query=None, limit=120):
     q = clean_inventory_search_value(payload_value(query, "q", "query", "search"), 200)
     params = []
     clauses = []
+    material_type = str(payload_value(query, "material_type", "type") or "").strip()
+    robot_class = str(payload_value(query, "robot_class", "robot") or "").strip()
+    if material_type in COMPETITION_MATERIAL_TYPES:
+        clauses.append("COALESCE(NULLIF(material_type, ''), 'other') = ?")
+        params.append(material_type)
+    if robot_class in COMPETITION_ROBOT_CLASSES:
+        clauses.append("COALESCE(NULLIF(robot_class, ''), 'shared') = ?")
+        params.append(robot_class)
     if q:
         tokens = [token for token in re.split(r"[\s,，;；、]+", q) if inventory_search_token_is_specific(token)]
         for token in tokens[:8]:
+            location_clause, location_params = competition_material_storage_location_clause(token)
+            if location_clause:
+                clauses.append(location_clause)
+                params.extend(location_params)
+                continue
             clause, clause_params = inventory_search_like_clause(
-                ["category", "name", "spec", "owner_name", "owner_group", "robot_name", "note"],
+                [
+                    "category",
+                    "name",
+                    "spec",
+                    "owner_name",
+                    "owner_group",
+                    "robot_name",
+                    "storage_location",
+                    "pcb_label",
+                    "note",
+                    "created_by",
+                ],
                 [token],
             )
             if clause:
@@ -8851,6 +9280,14 @@ def competition_material_rows(query=None, limit=120):
     params.append(max(1, min(parse_int(limit, INVENTORY_SEARCH_RESULT_LIMIT), 300)))
     with db() as conn:
         return conn.execute(sql, params).fetchall()
+
+
+def competition_material_grouped_rows(query=None, limit=120):
+    rows = [competition_material_row_dict(row) for row in competition_material_rows(query or {}, limit=limit)]
+    groups = {key: [] for key in COMPETITION_MATERIAL_TYPES}
+    for row in rows:
+        groups.setdefault(row["material_type"], []).append(row)
+    return groups, rows
 
 
 def competition_material_boms(limit=12):
@@ -8877,23 +9314,49 @@ def competition_material_summary():
             SELECT COUNT(*) AS item_count,
                    COALESCE(SUM(quantity), 0) AS total_quantity,
                    COUNT(DISTINCT owner_name) AS owner_count,
-                   COUNT(DISTINCT CASE WHEN bom_id != '' THEN bom_id END) AS bom_count
+                   COUNT(DISTINCT CASE WHEN bom_id != '' THEN bom_id END) AS bom_count,
+                   SUM(CASE WHEN COALESCE(NULLIF(photo_path, ''), '') != '' THEN 1 ELSE 0 END) AS photo_count
             FROM competition_material_items
             """
         ).fetchone()
+        type_rows = conn.execute(
+            """
+            SELECT material_type, category, name, spec, hardware_compare
+            FROM competition_material_items
+            """
+        ).fetchall()
+    mechanical_count = 0
+    hardware_count = 0
+    for item in type_rows:
+        material_type = row_value(item, "material_type", "") or infer_competition_material_type(
+            row_value(item, "category", ""),
+            row_value(item, "name", ""),
+            row_value(item, "spec", ""),
+        )
+        if material_type == "mechanical":
+            mechanical_count += 1
+        if material_type == "hardware" or parse_int(row_value(item, "hardware_compare", 0), 0):
+            hardware_count += 1
     return {
         "item_count": parse_int(row["item_count"], 0) if row else 0,
         "total_quantity": parse_int(row["total_quantity"], 0) if row else 0,
         "owner_count": parse_int(row["owner_count"], 0) if row else 0,
         "bom_count": parse_int(row["bom_count"], 0) if row else 0,
+        "mechanical_count": mechanical_count,
+        "hardware_count": hardware_count,
+        "photo_count": parse_int(row["photo_count"], 0) if row else 0,
     }
 
 
 def competition_material_hardware_status(row):
     if not parse_int(row_value(row, "hardware_compare", 0), 0):
-        return {"checked": False, "stock": 0, "status": "not_checked", "shortage": 0}
+        return {"checked": False, "stock": 0, "status": "not_checked", "shortage": 0, "linked_inventory": None}
     with db() as conn:
-        stock = inventory_stock_snapshot(conn, row["category"], row["name"], competition_material_aliases(row))
+        linked = linked_inventory_snapshot(conn, row_value(row, "linked_inventory_id", 0))
+        if linked:
+            stock = parse_int(linked["quantity"], 0)
+        else:
+            stock = inventory_stock_snapshot(conn, row["category"], row["name"], competition_material_aliases(row))
     required = max(1, parse_int(row["quantity"], 1))
     shortage = max(0, required - stock)
     return {
@@ -8901,45 +9364,71 @@ def competition_material_hardware_status(row):
         "stock": stock,
         "status": "shortage" if shortage > 0 else "stock_available",
         "shortage": shortage,
+        "linked_inventory": inventory_entry_from_row(linked) if linked else None,
     }
 
 
-def competition_material_table_html(rows, include_hardware_compare=True):
+def competition_material_card_html(row, include_hardware_compare=True):
+    item = competition_material_row_dict(row)
+    status = competition_material_hardware_status(row) if include_hardware_compare else {"checked": False}
+    if status.get("checked"):
+        linked = status.get("linked_inventory") or {}
+        linked_text = f"原仓库 {status['stock']} / 缺口 {status['shortage']}"
+        if linked:
+            linked_text += f" / {linked.get('location') or '-'}"
+        compare_html = f'<span class="spare-bop-status {"shortage" if status["shortage"] else "ok"}">{html.escape(linked_text)}</span>'
+    else:
+        compare_html = '<span class="muted">不对照原仓库</span>'
+    source = "机器人 BOM" if item["source_type"] == "bom" else "手动/拍照"
+    photo_url = competition_material_photo_url(row)
+    photo_html = (
+        f'<img src="{html.escape(photo_url, quote=True)}" alt="{html.escape(item["name"], quote=True)}">'
+        if photo_url
+        else '<div class="spare-photo-placeholder">无照片</div>'
+    )
+    pcb_html = ""
+    if item["pcb_label"]:
+        pcb_link = pcb_file_view_url(item["pcb_bom_id"], item["pcb_file_id"]) if item["pcb_bom_id"] and item["pcb_file_id"] else ""
+        label = html.escape(item["pcb_label"])
+        pcb_html = f'<a href="{html.escape(pcb_link, quote=True)}">{label}</a>' if pcb_link else label
+    else:
+        pcb_html = '<span class="muted">未关联 PCB</span>'
+    meta = [
+        item["material_type_label"],
+        item["robot_class_label"],
+        item["category"],
+        source,
+    ]
+    return f"""
+    <article class="spare-material-card" data-type="{html.escape(item['material_type'], quote=True)}">
+      <div class="spare-material-photo">{photo_html}</div>
+      <div class="spare-material-body">
+        <div class="spare-material-title">
+          <h3>{html.escape(item["name"])}</h3>
+          <strong>{item["quantity"]} {html.escape(item["unit"])}</strong>
+        </div>
+        <div class="spare-material-meta">{''.join(f'<span>{html.escape(part)}</span>' for part in meta if part)}</div>
+        <p>{html.escape(item["spec"] or item["note"] or "暂无规格说明")}</p>
+        <dl>
+          <div><dt>位置</dt><dd>{html.escape(item["storage_location"] or item["owner_name"] or "-")}</dd></div>
+          <div><dt>保管人</dt><dd>{html.escape(item["owner_name"] or "-")} / {html.escape(item["owner_group"] or "-")}</dd></div>
+          <div><dt>入库</dt><dd>{html.escape(item["created_at"] or "-")} / {html.escape(item["created_by"] or "-")}</dd></div>
+          <div><dt>PCB</dt><dd>{pcb_html}</dd></div>
+        </dl>
+        <div class="spare-material-foot">{compare_html}<span>{html.escape(item["note"] or "")}</span></div>
+      </div>
+    </article>
+    """
+
+
+def competition_material_cards_html(rows, include_hardware_compare=True):
     if not rows:
         return '<div class="empty">暂无比赛物资记录</div>'
-    body_rows = []
-    for row in rows:
-        status = competition_material_hardware_status(row) if include_hardware_compare else {"checked": False}
-        if status.get("checked"):
-            compare_html = (
-                f'<span class="spare-bop-status {"shortage" if status["shortage"] else "ok"}">'
-                f'原仓库 {status["stock"]} / 缺口 {status["shortage"]}</span>'
-            )
-        else:
-            compare_html = '<span class="muted">不对照</span>'
-        source = "机器人 BOM" if row["source_type"] == "bom" else "物资表单"
-        body_rows.append(
-            "<tr>"
-            f"<td>{html.escape(row['created_at'])}</td>"
-            f"<td>{html.escape(source)}</td>"
-            f"<td>{html.escape(row['robot_name'] or '-')}</td>"
-            f"<td>{html.escape(row['category'])}</td>"
-            f"<td><strong>{html.escape(row['name'])}</strong><small>{html.escape(row['spec'] or '-')}</small></td>"
-            f"<td>{parse_int(row['quantity'], 0)} {html.escape(row['unit'] or '个')}</td>"
-            f"<td>{html.escape(row['owner_name'])}</td>"
-            f"<td>{html.escape(row['owner_group'])}</td>"
-            f"<td>{compare_html}</td>"
-            f"<td>{html.escape(row['note'] or '-')}</td>"
-            "</tr>"
-        )
-    return (
-        '<div class="table-wrap"><table class="spare-bop-table"><thead><tr>'
-        '<th>时间</th><th>来源</th><th>机器人</th><th>类别</th><th>物资/规格</th>'
-        '<th>数量</th><th>位置/责任人</th><th>组别</th><th>原仓库对照</th><th>备注</th>'
-        '</tr></thead><tbody>'
-        + "".join(body_rows)
-        + "</tbody></table></div>"
-    )
+    return '<div class="spare-material-grid">' + "".join(competition_material_card_html(row, include_hardware_compare) for row in rows) + "</div>"
+
+
+def competition_material_table_html(rows, include_hardware_compare=True):
+    return competition_material_cards_html(rows, include_hardware_compare)
 
 
 def competition_material_search_table_html(rows):
@@ -8947,23 +9436,27 @@ def competition_material_search_table_html(rows):
         return '<div class="empty">暂无比赛备件仓库匹配记录</div>'
     body_rows = []
     for row in rows:
-        source = "机器人 BOM" if row["source_type"] == "bom" else "物资表单"
+        item = competition_material_row_dict(row)
+        source = "机器人 BOM" if item["source_type"] == "bom" else "手动/拍照"
+        photo_url = competition_material_photo_url(row)
+        photo_html = f'<img class="spare-search-photo" src="{html.escape(photo_url, quote=True)}" alt="">' if photo_url else "-"
         body_rows.append(
             "<tr>"
-            f"<td>{html.escape(row['created_at'])}</td>"
-            f"<td>{html.escape(row['category'])}</td>"
-            f"<td><div class=\"item-title\">{html.escape(row['name'])}</div><div class=\"item-sub\">{html.escape(row['spec'] or '-')}</div></td>"
-            f"<td>{parse_int(row['quantity'], 0)} {html.escape(row['unit'] or '个')}</td>"
-            f"<td>{html.escape(row['owner_name'])}</td>"
-            f"<td>{html.escape(row['owner_group'])}</td>"
-            f"<td>{html.escape(row['robot_name'] or '-')}</td>"
+            f"<td>{photo_html}</td>"
+            f"<td>{html.escape(item['created_at'])}<br><small>{html.escape(item['created_by'])}</small></td>"
+            f"<td>{html.escape(item['category'])}<br><small>{html.escape(item['material_type_label'])}</small></td>"
+            f"<td><div class=\"item-title\">{html.escape(item['name'])}</div><div class=\"item-sub\">{html.escape(item['spec'] or '-')}</div></td>"
+            f"<td>{item['quantity']} {html.escape(item['unit'])}</td>"
+            f"<td>{html.escape(item['storage_location'] or '-')}</td>"
+            f"<td>{html.escape(item['owner_name'])}<br><small>{html.escape(item['owner_group'])}</small></td>"
+            f"<td>{html.escape(item['robot_name'] or item['robot_class_label'])}</td>"
             f"<td>{html.escape(source)}</td>"
-            f"<td>{html.escape(row['note'] or '-')}</td>"
+            f"<td>{html.escape(item['pcb_label'] or item['note'] or '-')}</td>"
             "</tr>"
         )
     return (
-        '<div class="table-wrap"><table><thead><tr><th>时间</th><th>类别</th><th>名称/规格</th>'
-        '<th>数量</th><th>位置/责任人</th><th>组别</th><th>机器人</th><th>来源</th><th>备注</th></tr></thead><tbody>'
+        '<div class="table-wrap"><table><thead><tr><th>照片</th><th>入库时间/人</th><th>类别</th><th>名称/规格</th>'
+        '<th>数量</th><th>具体位置</th><th>保管人</th><th>机器人</th><th>来源</th><th>PCB/备注</th></tr></thead><tbody>'
         + "".join(body_rows)
         + "</tbody></table></div>"
     )
@@ -12876,46 +13369,133 @@ def admin_purchase_orders_page(user, query=None):
 
 def spare_bop_page(user, query=None, message="", error="", purchase_result=None):
     summary = competition_material_summary()
-    recent_rows = competition_material_rows({}, limit=80)
+    query = query or {}
+    filter_q = str(payload_value(query, "q") or "").strip()
+    filter_material_type = str(payload_value(query, "material_type") or "").strip()
+    filter_robot_class = str(payload_value(query, "robot_class") or "").strip()
+    result_rows = competition_material_rows(query, limit=160)
     boms = competition_material_boms(limit=10)
+
+    def select_options_from_mapping(mapping, selected="", include_all_label=""):
+        options = []
+        if include_all_label:
+            options.append(f'<option value="">{html.escape(include_all_label)}</option>')
+        for value, label in mapping.items():
+            options.append(
+                f'<option value="{html.escape(value, quote=True)}" {"selected" if selected == value else ""}>'
+                f'{html.escape(label)}</option>'
+            )
+        return "".join(options)
+
     category_options = "".join(
-        f'<option value="{html.escape(category)}">{html.escape(category)}</option>'
+        f'<option value="{html.escape(category, quote=True)}" {"selected" if category == "硬件器件" else ""}>{html.escape(category)}</option>'
         for category in COMPETITION_MATERIAL_CATEGORIES
     )
+    filter_type_options = select_options_from_mapping(COMPETITION_MATERIAL_TYPES, filter_material_type, "全部类型")
+    filter_robot_options = select_options_from_mapping(COMPETITION_ROBOT_CLASSES, filter_robot_class, "全部机器人")
+    material_type_options = select_options_from_mapping(COMPETITION_MATERIAL_TYPES, "hardware")
+    robot_class_options = select_options_from_mapping(COMPETITION_ROBOT_CLASSES, "shared")
     group_default = html.escape(str(user["team_group"] if "team_group" in user.keys() else "") or "未分组")
+    image_cfg = get_image_recognition_config(mask_key=True)
+    image_enabled = image_cfg.get("enabled") == "1" and bool(image_cfg.get("endpoint") and image_cfg.get("model"))
+    pcb_options = "".join(
+        f'<option value="{html.escape(item["value"], quote=True)}">{html.escape(item["label"])}</option>'
+        for item in competition_pcb_options()
+    )
+    inventory_options = "".join(
+        f'<option value="{item["id"]}">{html.escape(item["label"])}</option>'
+        for item in competition_inventory_link_options()
+    )
     bom_rows = "".join(
         "<tr>"
         f"<td>{html.escape(row['created_at'])}</td>"
         f"<td>{html.escape(row['title'])}</td>"
         f"<td>{html.escape(row['robot_name'] or '-')}</td>"
-        f"<td>{html.escape(row['created_by'])}</td>"
         f"<td>{parse_int(row['item_count'], 0)}</td>"
-        f"<td>{parse_int(row['total_quantity'], 0)}</td>"
-        f"<td>{html.escape(row['original_name'] or '-')}</td>"
         "</tr>"
         for row in boms
     )
+    result_label = "匹配结果" if (filter_q or filter_material_type or filter_robot_class) else "最近录入"
+    search_hint = (
+        f"当前显示 {len(result_rows)} 条；可按 HXX-XX-XX 位置、保管人、物资名、规格、PCB 或录入人检索"
+    )
+    photo_status = "已连接入库拍照识别 API" if image_enabled else "后台未启用图片识别 API，仍可保存真实照片"
     body = f"""
     <header class="page-head">
       <div><p class="eyebrow">Competition Materials</p><h1>比赛物资备件管理</h1></div>
       <div class="page-head-actions">
-        <a class="button" href="/inventory?warehouse=competition">搜索比赛备件仓库</a>
+        <a class="button" href="/inventory?warehouse=competition">从总检索查比赛备件</a>
         <a class="button" href="/inventory?warehouse=main">搜索原仓库</a>
       </div>
     </header>
     <section class="metrics spare-bop-metrics">
       {metric_card("物资记录", summary["item_count"], "独立比赛物资库")}
       {metric_card("总数量", summary["total_quantity"], "机器人所需物资")}
+      {metric_card("机械类", summary["mechanical_count"], "铝管/气泵/碳板等")}
+      {metric_card("硬件类", summary["hardware_count"], "可关联 PCB 与原库存")}
+      {metric_card("照片记录", summary["photo_count"], "真实照片留档")}
       {metric_card("责任人", summary["owner_count"], "专人专管")}
-      {metric_card("机器人 BOM", summary["bom_count"], "独立于原 BOM 对照")}
     </section>
-    <section class="spare-bop-layout">
+    {flash_box(message, "ok")}{flash_box(error, "error")}
+    <section class="panel spare-search-panel">
+      <div class="panel-head">
+        <div><h2>比赛备件独立检索</h2><span>{html.escape(search_hint)}</span></div>
+        <a class="button" href="/spares">清空筛选</a>
+      </div>
+      <form class="spare-search-form" method="get" action="/spares">
+        <label class="wide">搜索词
+          <input name="q" value="{html.escape(filter_q, quote=True)}" autocomplete="off" placeholder="输入 H1-07-04、H1、铝管、气泵、降压模块、保管人、PCB 名称或录入人">
+        </label>
+        <label>物资类型<select name="material_type">{filter_type_options}</select></label>
+        <label>机器人<select name="robot_class">{filter_robot_options}</select></label>
+        <button class="primary" type="submit">搜索比赛备件</button>
+      </form>
+    </section>
+    <section class="spare-bop-layout spare-workbench-layout">
       <section class="form-panel spare-bop-form-panel">
-        {flash_box(message, "ok")}{flash_box(error, "error")}
-        <div class="panel-head"><h2>上传机器人必备模块 BOM</h2><span>独立保存，不进入原 BOM 对照</span></div>
+        <div class="panel-head"><h2>拍照/手动录入比赛备件</h2><span>{html.escape(photo_status)}</span></div>
+        <div class="image-recognition-panel spare-image-panel" data-spares-image-recognition data-enabled="{"1" if image_enabled else "0"}">
+          <div>
+            <strong>真实照片留档 + AI 预填</strong>
+            <span>照片会随保存记录入库；识别只预填，不会自动提交。</span>
+          </div>
+          <div class="image-recognition-actions">
+            <label class="button" for="spare-photo-input">拍照/上传</label>
+            <button class="button" type="button" id="spare-recognize-photo">识别当前照片</button>
+          </div>
+          <div class="image-recognition-status" id="spare-image-status">选择照片后可直接识别；如果 API 未启用，也可以只保存照片。</div>
+          <div class="image-recognition-results" id="spare-image-results"></div>
+        </div>
+        <form class="entry-form spare-bop-form" method="post" action="/spares" enctype="multipart/form-data" data-spare-material-form>
+          <label>机器人类别<select name="robot_class" id="spare-robot-class">{robot_class_options}</select></label>
+          <label>机器人/用途<input name="robot_name" id="spare-robot-name" placeholder="例如：机器人1、机器人2、通用备件"></label>
+          <label>物资类型<select name="material_type" id="spare-material-type">{material_type_options}</select></label>
+          <label>物资类别<select name="category" id="spare-category">{category_options}</select></label>
+          <label>物资名称<input name="name" id="spare-name" required placeholder="例如：碳板、气泵、降压模块、云台电机"></label>
+          <label>规格型号<input name="spec" id="spare-spec" placeholder="例如：3K 2mm、24V转5V 5A、M3x10"></label>
+          <label>数量<input name="quantity" id="spare-quantity" type="number" min="1" value="1" required></label>
+          <label>单位<input name="unit" id="spare-unit" value="个" placeholder="个 / 根 / 片 / 套"></label>
+          <label class="wide">具体位置<input name="storage_location" id="spare-location" placeholder="例如：H1-07-04、H2、赛场工具箱-气动盒"></label>
+          <label>保管人<input name="owner_name" id="spare-owner-name" required placeholder="专管责任人姓名"></label>
+          <label>保管组别<input name="owner_group" id="spare-owner-group" value="{group_default}" placeholder="机械组 / 电控组 / 硬件组"></label>
+          <label class="wide">真实照片<input id="spare-photo-input" type="file" name="competition_photo" accept="image/*" capture="environment"></label>
+          <section class="wide spare-hardware-section" data-spare-hardware-section>
+            <div class="panel-head compact-head"><h2>硬件关联</h2><span>硬件类耗材可关联 PCB 与原库存</span></div>
+            <label class="inline-field"><span>对照原仓库库存</span><input type="checkbox" name="hardware_compare" id="spare-hardware-compare" value="1" checked></label>
+            <label>关联原库存<select name="linked_inventory_id" id="spare-linked-inventory"><option value="">不关联原库存</option>{inventory_options}</select></label>
+            <label>关联 PCB<select name="pcb_ref" id="spare-pcb-ref"><option value="">不关联 PCB</option>{pcb_options}</select></label>
+          </section>
+          <label class="wide">备注<textarea name="note" id="spare-note" rows="3" placeholder="采购来源、贵重物品编号、保管要求、适用车型等"></textarea></label>
+          <div class="wide form-actions">
+            <button class="primary" type="submit">保存比赛物资</button>
+          </div>
+        </form>
+      </section>
+      <section class="form-panel spare-bop-form-panel">
+        <div class="panel-head"><h2>批量上传机器人备件 BOM</h2><span>CSV / XLSX / TXT 会写入比赛备件库</span></div>
         <form class="entry-form spare-bop-form" method="post" action="/spares/bom" enctype="multipart/form-data">
-          <label>BOM 标题<input name="title" required placeholder="例如：英雄机器人必备模块 BOM"></label>
-          <label>机器人名称<input name="robot_name" required placeholder="例如：机器人1 / 英雄 / 步兵"></label>
+          <label>BOM 标题<input name="title" required placeholder="例如：双车赛前必备备件清单"></label>
+          <label>机器人名称<input name="robot_name" required placeholder="例如：机器人1 / 机器人2 / 双车通用"></label>
           <label>赛季/场次<input name="season" placeholder="例如：2026 RM 分区赛"></label>
           <label>责任人<input name="owner_name" required placeholder="负责该机器人 BOM 的人"></label>
           <label>责任人组别<input name="owner_group" value="{group_default}" placeholder="机械组 / 电控组 / 硬件组"></label>
@@ -12924,39 +13504,21 @@ def spare_bop_page(user, query=None, message="", error="", purchase_result=None)
             <button class="primary" type="submit">上传比赛物资 BOM</button>
           </div>
         </form>
-      </section>
-      <section class="form-panel spare-bop-form-panel">
-        <div class="panel-head"><h2>填写比赛物资表单</h2><span>机械、电控、耗材、贵重物品专用</span></div>
-        <form class="entry-form spare-bop-form" method="post" action="/spares">
-          <label>机器人/用途<input name="robot_name" placeholder="例如：机器人1、机器人2、通用备件"></label>
-          <label>类别<select name="category">{category_options}</select></label>
-          <label>物资名称<input name="name" required placeholder="例如：碳板、降压模块、云台电机"></label>
-          <label>规格型号<input name="spec" placeholder="例如：3K 2mm、24V转5V 5A"></label>
-          <label>数量<input name="quantity" type="number" min="1" value="1" required></label>
-          <label>单位<input name="unit" value="个" placeholder="个 / 根 / 片 / 套"></label>
-          <label>责任人<input name="owner_name" required placeholder="专管责任人姓名"></label>
-          <label>责任人组别<input name="owner_group" value="{group_default}" placeholder="机械组 / 电控组 / 硬件组"></label>
-          <label class="wide inline-field"><span>硬件器件对照原仓库</span><input type="checkbox" name="hardware_compare" value="1" checked></label>
-          <label class="wide">备注<textarea name="note" rows="3" placeholder="采购来源、贵重物品编号、保管要求等"></textarea></label>
-          <div class="wide form-actions">
-            <button class="primary" type="submit">保存比赛物资</button>
-          </div>
-        </form>
+        <div class="spare-bom-mini-list">
+          <strong>最近上传</strong>
+          <div class="table-wrap"><table><thead><tr><th>时间</th><th>标题</th><th>机器人</th><th>行数</th></tr></thead><tbody>{bom_rows or '<tr><td colspan="4">暂无比赛物资 BOM。</td></tr>'}</tbody></table></div>
+        </div>
       </section>
     </section>
     <section class="panel spare-bop-detail">
       <div class="panel-head">
-        <div><h2>比赛物资专用仓库</h2><span>位置字段在这里替换为责任人和组别</span></div>
-        <a class="button" href="/inventory?warehouse=competition">检索比赛物资</a>
+        <div><h2>{html.escape(result_label)}</h2><span>照片、位置、保管人、入库时间、入库人和 PCB 关联会一起展示</span></div>
+        <a class="button" href="/inventory?warehouse=both">去总检索联查原仓库</a>
       </div>
-      {competition_material_table_html(recent_rows)}
-    </section>
-    <section class="panel spare-bop-detail">
-      <div class="panel-head"><h2>最近上传的机器人 BOM</h2><span>与原 BOM 对照隔离</span></div>
-      <div class="table-wrap"><table><thead><tr><th>时间</th><th>标题</th><th>机器人</th><th>上传人</th><th>行数</th><th>总数量</th><th>原文件</th></tr></thead><tbody>{bom_rows or '<tr><td colspan="7">暂无比赛物资 BOM。</td></tr>'}</tbody></table></div>
+      {competition_material_cards_html(result_rows)}
     </section>
     """
-    return render_layout("比赛物资备件管理", body, user, "比赛备件")
+    return render_layout("比赛物资备件管理", body, user, "比赛备件", scripts=["/static/spares.js"])
 
 
 def bom_page(user, message="", error="", result=None):
@@ -13371,10 +13933,29 @@ def assistant_http_json(url, api_key="", body=None, timeout=30):
     raw = raw.strip()
     if not raw:
         raise RuntimeError("API 返回空内容，请检查地址是否是兼容 OpenAI 的接口。")
+    if re.match(r"(?is)^<!doctype\s+html\b|^<html\b", raw):
+        raise RuntimeError(
+            "API 返回的是网页 HTML，不是 JSON。请检查后台 API 地址是否填写到兼容 OpenAI 的接口路径，"
+            "通常应类似 https://api.example.com/v1，而不是普通网站首页。"
+        )
     try:
         return json.loads(raw)
     except Exception as exc:
-        raise RuntimeError(f"API 返回的不是 JSON：{raw[:500]}") from exc
+        preview = re.sub(r"\s+", " ", raw[:220]).strip()
+        raise RuntimeError(f"API 返回的不是 JSON，请检查接口地址和模型格式。返回片段：{preview}") from exc
+
+
+def assistant_chat_url_fallbacks(endpoint):
+    primary = assistant_chat_url(endpoint)
+    urls = []
+    if primary:
+        urls.append(primary)
+    base = assistant_base_url(endpoint)
+    if base and not re.search(r"/v\d+(?:/)?$", base):
+        fallback = base.rstrip("/") + "/v1/chat/completions"
+        if fallback not in urls:
+            urls.append(fallback)
+    return urls
 
 
 def extract_assistant_text(data):
@@ -13399,13 +13980,19 @@ def extract_assistant_text(data):
 def inventory_image_error_message(exc):
     detail = str(exc or "").strip()
     lowered = detail.lower()
+    if "api 返回的是网页 html" in lowered:
+        return (
+            "图片识别 API 地址返回了网页，不是模型 JSON 接口。"
+            "请在后台把“入库拍照识别 API”的地址改成兼容 OpenAI 的接口基址，"
+            "例如 https://api.xxx.com/v1；如果网关不支持图片输入，还需要换成支持视觉输入的模型。"
+        )
     if "image_url" in lowered and ("expected `text`" in lowered or "expected text" in lowered or "unknown variant" in lowered):
         return (
             "当前配置的图片识别 API 不支持直接接收图片。"
             "请在后台把“入库拍照识别 API”改成支持视觉/图片输入的模型接口，"
             "或先接入 OCR，把图片转成文字后再交给当前文本模型分析。"
         )
-    if "api 返回空内容" in detail or "not json" in lowered:
+    if "api 返回空内容" in detail or "not json" in lowered or "不是 json" in lowered:
         return detail
     if detail.startswith("HTTP 401") or detail.startswith("HTTP 403"):
         return "图片识别 API 鉴权失败，请检查后台配置的 API Key、接口地址和账号权限。"
@@ -13416,18 +14003,18 @@ def inventory_image_error_message(exc):
     return detail or "图片识别 API 调用失败，请检查后台配置。"
 
 
-def call_inventory_image_recognition(image_bytes, mime_type, filename, user):
+def call_inventory_image_recognition(image_bytes, mime_type, filename, user, recognition_prompt=None):
     cfg = get_image_recognition_config()
     if cfg.get("enabled") != "1":
         raise RuntimeError("图片识别 API 尚未启用，请管理员先在后台配置。")
-    endpoint = assistant_chat_url(cfg.get("endpoint", ""))
-    if not endpoint.startswith(("http://", "https://")):
+    endpoints = assistant_chat_url_fallbacks(cfg.get("endpoint", ""))
+    if not endpoints or not endpoints[0].startswith(("http://", "https://")):
         raise RuntimeError("图片识别 API 地址无效，只支持 http 或 https。")
     model = cfg.get("model", "").strip()
     if not model:
         raise RuntimeError("图片识别模型名为空。")
     encoded = base64.b64encode(image_bytes).decode("ascii")
-    prompt = (
+    prompt = recognition_prompt or (
         "请识别这张入库图片中的电子元器件完整信息。只返回 JSON，不要返回 Markdown。"
         "JSON 格式：{\"items\":[{\"lcsc_code\":\"\",\"category\":\"\",\"name\":\"\","
         "\"value_spec\":\"\",\"package\":\"\",\"voltage\":\"\",\"brand\":\"\",\"quantity\":1,"
@@ -13449,7 +14036,19 @@ def call_inventory_image_recognition(image_bytes, mime_type, filename, user):
         "temperature": float(cfg.get("temperature") or 0),
         "max_tokens": clamp_int(cfg.get("max_tokens"), 900, 100, 4000),
     }
-    data = assistant_http_json(endpoint, cfg.get("api_key", ""), body, parse_int(cfg.get("timeout"), 45))
+    timeout = parse_int(cfg.get("timeout"), 45)
+    errors = []
+    data = None
+    for endpoint in endpoints:
+        try:
+            data = assistant_http_json(endpoint, cfg.get("api_key", ""), body, timeout)
+            break
+        except Exception as exc:
+            errors.append(str(exc))
+            if "网页 HTML" not in str(exc) and "不是 JSON" not in str(exc):
+                raise
+    if data is None:
+        raise RuntimeError(errors[-1] if errors else "图片识别 API 调用失败，请检查后台配置。")
     answer = extract_assistant_text(data)
     parsed = extract_json_object(answer)
     items = normalize_inventory_image_result(parsed)
@@ -14623,6 +15222,8 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             return self.send_html(changelog_page(user))
         if path == "/bom":
             return self.send_html(bom_page(user))
+        if path.startswith("/spares/photo/"):
+            return self.serve_competition_material_photo(user, path)
         if path == "/spares":
             return self.send_html(spare_bop_page(user, query))
         if path == "/workflow":
@@ -14766,6 +15367,8 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/inventory/") and parsed.path.endswith("/adjust"):
             inventory_id = urllib.parse.unquote(parsed.path[len("/api/inventory/") : -len("/adjust")]).strip()
             return self.api_adjust_inventory_quantity(user, inventory_id)
+        if parsed.path == "/api/spares/image-recognize":
+            return self.api_competition_material_image_recognize(user)
         if parsed.path == "/api/inventory/image-recognize":
             return self.api_inventory_image_recognize(user)
         if parsed.path == "/inventory/new":
@@ -14825,6 +15428,48 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def serve_competition_material_photo(self, user, path):
+        match = re.fullmatch(r"/spares/photo/(\d+)", path)
+        if not match:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            self.log_access_db(HTTPStatus.NOT_FOUND)
+            return
+        item_id = parse_int(match.group(1), 0)
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT id, photo_path, photo_mime_type, photo_original_name
+                FROM competition_material_items
+                WHERE id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+        if not row or not row["photo_path"]:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            self.log_access_db(HTTPStatus.NOT_FOUND)
+            return
+        target = (DATA_DIR / str(row["photo_path"])).resolve()
+        if not path_is_relative_to(target, COMPETITION_MATERIAL_PHOTOS_DIR) or not target.exists() or not target.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            self.log_access_db(HTTPStatus.NOT_FOUND)
+            return
+        content_type = str(row["photo_mime_type"] or mimetypes.guess_type(str(target))[0] or "application/octet-stream")
+        if content_type not in INVENTORY_IMAGE_ALLOWED_MIME_TYPES:
+            content_type = "application/octet-stream"
+        data = read_data_bytes(target)
+        self.send_response(HTTPStatus.OK)
+        self.send_security_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header(
+            "Content-Disposition",
+            "inline; " + content_disposition_filename(row["photo_original_name"] or target.name),
+        )
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        self.log_access_db(HTTPStatus.OK)
 
     def api_pcb_keyframes(self):
         payload = {"shots": [], "updated_at": None}
@@ -16193,8 +16838,16 @@ class WarehouseHandler(BaseHTTPRequestHandler):
 
     def create_competition_material_item(self, user):
         try:
-            form = self.read_form()
-            item = create_competition_material_manual_item(user, form)
+            photo_meta = {}
+            if "multipart/form-data" in self.headers.get("Content-Type", "").lower():
+                fields, files = self.read_multipart()
+                uploads = collect_uploaded_files(files, COMPETITION_MATERIAL_IMAGE_FIELD_NAMES)
+                if uploads:
+                    photo_meta = store_competition_material_photo(uploads[0])
+                form = fields
+            else:
+                form = self.read_form()
+            item = create_competition_material_manual_item(user, form, photo_meta=photo_meta)
             return self.send_html(spare_bop_page(user, message=f"已保存比赛物资：{item['name']}。"))
         except Exception as exc:
             return self.send_html(spare_bop_page(user, error=str(exc)), HTTPStatus.BAD_REQUEST)
@@ -16307,6 +16960,46 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             if not result.get("items"):
                 result["error"] = "AI 未能从图片中识别出可入库器件，请换一张更清晰的图片或手动录入。"
             return self.send_json(result, status)
+        except ValueError as exc:
+            return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            return self.send_json({"error": inventory_image_error_message(exc)}, HTTPStatus.BAD_GATEWAY)
+
+    def api_competition_material_image_recognize(self, user):
+        try:
+            _, files = self.read_multipart()
+            uploads = collect_uploaded_files(files, COMPETITION_MATERIAL_IMAGE_FIELD_NAMES)
+            upload = uploads[0] if uploads else None
+            if not upload:
+                return self.send_json({"error": "请上传一张比赛备件照片。"}, HTTPStatus.BAD_REQUEST)
+            filename = safe_name(upload.get("filename") or "competition_spare_image")
+            content = upload.get("content") or b""
+            if not content:
+                return self.send_json({"error": "图片内容为空。"}, HTTPStatus.BAD_REQUEST)
+            if len(content) > INVENTORY_IMAGE_MAX_BYTES:
+                return self.send_json({"error": "图片超过 8MB，请压缩后再上传。"}, HTTPStatus.BAD_REQUEST)
+            mime_type = str(upload.get("content_type") or mimetypes.guess_type(filename)[0] or "").split(";", 1)[0].lower()
+            if mime_type not in INVENTORY_IMAGE_ALLOWED_MIME_TYPES:
+                return self.send_json({"error": "仅支持 JPG、PNG、WEBP 或 GIF 图片。"}, HTTPStatus.BAD_REQUEST)
+            prompt = (
+                "请识别这张比赛机器人备件照片中的物资。它可能是机械类耗材或硬件类耗材，"
+                "包括铝管、型材、碳板、气泵、电磁阀、气动元件、螺栓螺母、紧固件、"
+                "电控模块、PCB板、传感器、线材、接插件、电机、工具和通用耗材。"
+                "只返回 JSON，不要返回 Markdown。JSON 格式："
+                "{\"items\":[{\"lcsc_code\":\"\",\"category\":\"\",\"name\":\"\","
+                "\"value_spec\":\"\",\"package\":\"\",\"voltage\":\"\",\"brand\":\"\","
+                "\"quantity\":1,\"location\":\"\",\"product_url\":\"\",\"note\":\"\","
+                "\"confidence\":0.0}],\"summary\":\"\"}。"
+                "category 请优先使用机械结构、铝管/型材、碳板/板材、气动元件、气泵、电磁阀、"
+                "螺栓/螺母、电控模块、硬件器件、线材/接插件、传感器、电机/执行器、工具/耗材、"
+                "贵重物品、其他。无法确认的字段填空，数量无法判断时填 1。"
+            )
+            result = call_inventory_image_recognition(content, mime_type, filename, user, recognition_prompt=prompt)
+            payload = competition_image_recognition_payload(result)
+            status = HTTPStatus.OK if payload.get("items") else HTTPStatus.UNPROCESSABLE_ENTITY
+            if not payload.get("items"):
+                payload["error"] = "AI 未能从图片中识别出比赛备件，请换一张更清晰的照片或手动录入。"
+            return self.send_json(payload, status)
         except ValueError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
